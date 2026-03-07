@@ -40,10 +40,30 @@ for _sub in ('include', 'share', 'lib/pkgconfig'):
     elif os.path.isdir(_p):
         _shutil.rmtree(_p)
 
+# ---------------------------------------------------------------------------
+# On Windows, pythonnet/clr_loader ship native DLLs that PyInstaller
+# does not collect automatically.  Gather them before Analysis.
+# ---------------------------------------------------------------------------
+from PyInstaller.utils.hooks import collect_all as _collect_all
+
+_extra_datas = []
+_extra_binaries = []
+_extra_hiddenimports = []
+
+if _is_windows:
+    for _pkg in ('pythonnet', 'clr_loader'):
+        try:
+            _d, _b, _h = _collect_all(_pkg)
+            _extra_datas += _d
+            _extra_binaries += _b
+            _extra_hiddenimports += _h
+        except Exception:
+            pass
+
 a = Analysis(
     ['launcher.py'],
     pathex=[],
-    binaries=[],
+    binaries=_extra_binaries,
     datas=[
         ('VERSION', '.'),
         ('.gitignore', '.'),
@@ -61,11 +81,11 @@ a = Analysis(
         ('tests', 'tests'),
         ('assets/logo.jpg', 'assets'),
         ('python-standalone', 'python-standalone'),
-    ],
+    ] + _extra_datas,
     hiddenimports=[
         'webview',
         'ouroboros.config',
-    ],
+    ] + _extra_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
