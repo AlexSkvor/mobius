@@ -180,13 +180,16 @@ class LocalModelManager:
             log.info("Starting local model server: %s", " ".join(cmd))
 
             try:
-                self._proc = subprocess.Popen(
-                    cmd,
+                _popen_kwargs = dict(
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     stdin=subprocess.DEVNULL,
-                    start_new_session=True,
                 )
+                if sys.platform == "win32":
+                    _popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                else:
+                    _popen_kwargs["start_new_session"] = True
+                self._proc = subprocess.Popen(cmd, **_popen_kwargs)
             except FileNotFoundError:
                 self._status = "error"
                 if IS_MACOS:

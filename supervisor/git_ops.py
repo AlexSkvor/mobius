@@ -106,14 +106,15 @@ def _ensure_repo_gitignore(repo_dir: pathlib.Path = None) -> None:
 
 def ensure_repo_present() -> None:
     if not (REPO_DIR / ".git").exists():
-        subprocess.run(["rm", "-rf", str(REPO_DIR)], check=False)
+        if REPO_DIR.exists():
+            shutil.rmtree(REPO_DIR, ignore_errors=True)
         REPO_DIR.mkdir(parents=True, exist_ok=True)
         _ensure_repo_gitignore()
         import dulwich.repo
         dulwich.repo.Repo.init(str(REPO_DIR))
         
         subprocess.run(["git", "config", "user.name", "Ouroboros"], cwd=str(REPO_DIR), check=True)
-        subprocess.run(["git", "config", "user.email", "ouroboros@local.mac"], cwd=str(REPO_DIR), check=True)
+        subprocess.run(["git", "config", "user.email", "ouroboros@localhost"], cwd=str(REPO_DIR), check=True)
         
         rc, _, _ = git_capture(["git", "status", "--porcelain"])
         if rc == 0:

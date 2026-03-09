@@ -34,7 +34,10 @@ def _tracked_subprocess_run(cmd, **kwargs):
     entire process tree can be killed via os.killpg() on panic.
     """
     timeout = kwargs.pop("timeout", None)
-    kwargs["start_new_session"] = True
+    if IS_WINDOWS:
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
     kwargs.setdefault("stdin", subprocess.DEVNULL)
     proc = Popen(cmd, **kwargs)
     with _subprocess_lock:

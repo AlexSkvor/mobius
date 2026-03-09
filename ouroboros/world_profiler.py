@@ -20,7 +20,7 @@ def generate_world_profile(output_path: str):
     
     # Check for CLI tools
     tools = []
-    for tool in ["git", "python3", "pip", "npm", "node", "claude"]:
+    for tool in ["git", "python3", "python", "pip", "npm", "node", "claude"]:
         if shutil.which(tool):
             tools.append(tool)
             
