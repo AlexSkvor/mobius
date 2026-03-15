@@ -24,7 +24,7 @@ export function initAbout({ ws, state }) {
                 <span>Created by <strong>Anton Razzhigaev</strong> & <strong>Andrew Kaznacheev</strong></span>
                 <div style="display:flex;gap:16px;justify-content:center;margin-top:4px">
                     <a href="https://t.me/abstractDL" target="_blank" style="color:var(--accent);text-decoration:none">@abstractDL</a>
-                    <a href="https://github.com/joi-lab/ouroboros-desktop" target="_blank" style="color:var(--accent);text-decoration:none">GitHub</a>
+                    <a href="https://github.com/joi-lab/ouroboros" target="_blank" style="color:var(--accent);text-decoration:none">GitHub</a>
                 </div>
             </div>
             <div style="margin-top:auto;padding-top:32px;color:var(--text-muted);font-size:12px">Joi Lab</div>

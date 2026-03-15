@@ -1,5 +1,5 @@
-"""Tests for tool-history compaction protection (context.py)."""
-from ouroboros.context import compact_tool_history, _COMPACTION_PROTECTED_TOOLS
+"""Tests for tool-history compaction protection (context_compaction.py)."""
+from ouroboros.context_compaction import compact_tool_history, _COMPACTION_PROTECTED_TOOLS
 
 
 def _make_messages(tool_name: str, result_content: str, num_rounds: int = 8):
@@ -19,6 +19,28 @@ def _make_messages(tool_name: str, result_content: str, num_rounds: int = 8):
             "role": "tool",
             "tool_call_id": tc_id,
             "content": result_content,
+        })
+    return messages
+
+
+def _make_large_arg_messages(tool_name: str, num_rounds: int = 8):
+    """Build messages whose old assistant tool-call payloads should compact."""
+    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}]
+    large_args = '{"content": "' + ("x" * 1000) + '"}'
+    for i in range(num_rounds):
+        tc_id = f"call_{i}"
+        messages.append({
+            "role": "assistant",
+            "content": f"Round {i}",
+            "tool_calls": [{
+                "id": tc_id,
+                "function": {"name": tool_name, "arguments": large_args},
+            }],
+        })
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tc_id,
+            "content": "ok",
         })
     return messages
 
@@ -49,14 +71,15 @@ def test_warning_results_survive_compaction():
     assert len(warning_results) == 10, "Warning-prefixed results must survive compaction"
 
 
-def test_normal_tool_results_are_compacted():
-    """Non-protected tool results in old rounds should be compacted."""
-    long_result = "x" * 500
-    msgs = _make_messages("repo_read", long_result, num_rounds=10)
+def test_old_assistant_tool_payloads_are_compacted():
+    """Fallback compaction should compact oversized old assistant tool-call payloads."""
+    msgs = _make_large_arg_messages("repo_write", num_rounds=10)
     compacted = compact_tool_history(msgs, keep_recent=3)
 
-    old_tool_results = [
+    compacted_assistants = [
         m for m in compacted
-        if m.get("role") == "tool" and m.get("content") != long_result
+        if m.get("role") == "assistant"
+        and m.get("tool_calls")
+        and "<<CONTENT_OMITTED len=" in m["tool_calls"][0]["function"]["arguments"]
     ]
-    assert len(old_tool_results) >= 4, "Old repo_read results should be compacted"
+    assert len(compacted_assistants) >= 4, "Old oversized assistant tool-call payloads should be compacted"

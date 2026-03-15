@@ -44,7 +44,7 @@ def _promote_to_stable(ctx: ToolContext, reason: str) -> str:
 
 def _schedule_task(ctx: ToolContext, description: str, context: str = "", parent_task_id: str = "") -> str:
     current_depth = getattr(ctx, 'task_depth', 0)
-    new_depth = current_depth + 1 if parent_task_id else 0
+    new_depth = current_depth + 1
     if new_depth > MAX_SUBTASK_DEPTH:
         return f"ERROR: Subtask depth limit ({MAX_SUBTASK_DEPTH}) exceeded. Simplify your approach."
 
@@ -87,7 +87,7 @@ def _chat_history(ctx: ToolContext, count: int = 100, offset: int = 0, search: s
 
 
 def _update_scratchpad(ctx: ToolContext, content: str) -> str:
-    """LLM-driven scratchpad update (Constitution P3: LLM-first)."""
+    """LLM-driven scratchpad update — appends a timestamped block (Constitution P3: LLM-first)."""
     if not content or not isinstance(content, str) or len(content.strip()) < 10:
         return (
             "⚠️ REJECTED: content is empty or too short "
@@ -98,20 +98,12 @@ def _update_scratchpad(ctx: ToolContext, content: str) -> str:
     from ouroboros.memory import Memory
     mem = Memory(drive_root=ctx.drive_root)
     mem.ensure_files()
-    old_content = mem.load_scratchpad()
-    mem.save_scratchpad(content)
-    mem.append_journal({
-        "ts": utc_now_iso(),
-        "content_preview": content[:500],
-        "content_len": len(content),
-        "old_content_full": old_content,
-        "old_content_len": len(old_content),
-    })
-    return f"OK: scratchpad updated ({len(content)} chars)"
+    block = mem.append_scratchpad_block(content, source="task")
+    return f"OK: scratchpad block appended ({len(content)} chars, ts={block.get('ts', '?')[:16]})"
 
 
-def _send_owner_message(ctx: ToolContext, text: str, reason: str = "") -> str:
-    """Send a proactive message to the owner (not as reply to a task).
+def _send_user_message(ctx: ToolContext, text: str, reason: str = "") -> str:
+    """Send a proactive message to the user (not as reply to a task).
 
     Use when you have something genuinely worth saying — an insight,
     a question, a status update, or an invitation to collaborate.
@@ -304,22 +296,24 @@ def get_tools() -> List[ToolEntry]:
         }, _chat_history),
         ToolEntry("update_scratchpad", {
             "name": "update_scratchpad",
-            "description": "Update your working memory. Write freely — any format you find useful. "
-                           "This persists across sessions and is read at every task start.",
+            "description": "Append a block to your working memory (scratchpad). Each call adds a "
+                           "timestamped block; oldest blocks are auto-evicted when the cap (10) is reached. "
+                           "Write what matters NOW — active tasks, decisions, observations. "
+                           "Persists across sessions, read at every task start.",
             "parameters": {"type": "object", "properties": {
-                "content": {"type": "string", "description": "Full scratchpad content"},
+                "content": {"type": "string", "description": "Content for this scratchpad block"},
             }, "required": ["content"]},
         }, _update_scratchpad),
-        ToolEntry("send_owner_message", {
-            "name": "send_owner_message",
-            "description": "Send a proactive message to the owner. Use when you have something "
+        ToolEntry("send_user_message", {
+            "name": "send_user_message",
+            "description": "Send a proactive message to the user. Use when you have something "
                            "genuinely worth saying — an insight, a question, or an invitation to collaborate. "
                            "This is NOT for task responses (those go automatically).",
             "parameters": {"type": "object", "properties": {
                 "text": {"type": "string", "description": "Message text"},
                 "reason": {"type": "string", "description": "Why you're reaching out (logged, not sent)"},
             }, "required": ["text"]},
-        }, _send_owner_message),
+        }, _send_user_message),
         ToolEntry("update_identity", {
             "name": "update_identity",
             "description": "Update your identity manifest (who you are, who you want to become). "

@@ -96,8 +96,10 @@ Derived from P5 (Minimalism): entire codebase fits in one context window.
 
 Every commit through `repo_commit` or `repo_write_commit` passes a **unified
 pre-commit review** — three models review the staged diff against
-`docs/CHECKLISTS.md` before commit. Critical FAILs block the commit; advisory
-FAILs are shown as warnings. See `ouroboros/tools/review.py` for implementation.
+`docs/CHECKLISTS.md` before commit. Review enforcement is configurable:
+`Blocking` preserves the current hard gate, while `Advisory` still runs the
+same review but downgrades findings and review-phase failures to warnings.
+See `ouroboros/tools/review.py` for implementation.
 
 Preferred workflow for multi-file changes: `repo_write` all files first, then
 `repo_commit` to stage, review, and commit everything in one diff.

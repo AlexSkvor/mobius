@@ -91,13 +91,14 @@ class LocalChatBridge:
         return True
 
     def send_photo(self, chat_id: int, photo_bytes: bytes,
-                   caption: str = "") -> Tuple[bool, str]:
+                   caption: str = "", mime: str = "image/png") -> Tuple[bool, str]:
         """Send photo to UI."""
         import base64
         b64_str = base64.b64encode(photo_bytes).decode("ascii")
         msg = {
             "type": "photo",
             "image_base64": b64_str,
+            "mime": mime,
             "caption": caption,
             "ts": datetime.datetime.utcnow().isoformat() + "Z",
         }
@@ -242,21 +243,25 @@ def log_chat(direction: str, chat_id: int, user_id: int, text: str) -> None:
 
 def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
                      force_budget: bool = False, fmt: str = "",
-                     is_progress: bool = False) -> None:
+                     is_progress: bool = False, task_id: str = "") -> None:
     # force_budget kept in signature for caller compat but is a no-op since 3.3.0
     st = load_state()
     owner_id = int(st.get("owner_id") or 0)
+    _text = str(text or "")
 
     if is_progress and DATA_DIR:
         append_jsonl(DATA_DIR / "logs" / "progress.jsonl", {
             "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "type": "send_message",
+            "task_id": task_id,
+            "is_progress": True,
             "direction": "out", "chat_id": chat_id, "user_id": owner_id,
             "text": text if log_text is None else log_text,
+            "content": _text,
         })
     else:
         log_chat("out", chat_id, owner_id, text if log_text is None else log_text)
 
-    _text = str(text or "")
     if _text.strip() in ("", "\u200b"):
         return
     # Budget footers are now shown in dashboard/status flows, not auto-appended

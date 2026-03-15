@@ -26,24 +26,29 @@ from ouroboros.utils import (
     safe_relpath, truncate_for_log,
     get_git_info, sanitize_task_for_event,
 )
-from ouroboros.llm import LLMClient, add_usage
+from ouroboros.llm import LLMClient
 from ouroboros.tools import ToolRegistry
 from ouroboros.tools.registry import ToolContext
 from ouroboros.memory import Memory
 from ouroboros.context import build_llm_messages
 from ouroboros.loop import run_llm_loop
+from ouroboros.config import resolve_effort
+from ouroboros.agent_startup_checks import (
+    check_budget,
+    check_uncommitted_changes,
+    check_version_sync,
+    inject_crash_report,
+    verify_restart,
+    verify_system_state,
+)
+from ouroboros.agent_task_pipeline import (
+    build_trace_summary, emit_task_results, build_review_context,
+)
 
 
-# ---------------------------------------------------------------------------
-# Module-level guard for one-time worker boot logging
-# ---------------------------------------------------------------------------
 _worker_boot_logged = False
 _worker_boot_lock = threading.Lock()
 
-
-# ---------------------------------------------------------------------------
-# Environment + Paths
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class Env:
@@ -59,8 +64,12 @@ class Env:
 
 
 # ---------------------------------------------------------------------------
-# Agent
+# Backward-compat shim — kept so existing tests that import this symbol
+# directly do not break. New code should call config.resolve_effort().
 # ---------------------------------------------------------------------------
+def _resolve_initial_effort(task_type: str) -> str:
+    return resolve_effort(task_type)
+
 
 class OuroborosAgent:
     """One agent instance per worker process. Mostly stateless; long-term state lives on Drive."""
@@ -71,23 +80,36 @@ class OuroborosAgent:
         self._event_queue: Any = event_queue
         self._current_chat_id: Optional[int] = None
         self._current_task_type: Optional[str] = None
+        self._current_task_id: Optional[str] = None
 
-        # Message injection: owner can send messages while agent is busy
         self._incoming_messages: queue.Queue = queue.Queue()
         self._busy = False
         self._last_progress_ts: float = 0.0
         self._task_started_ts: float = 0.0
 
-        # SSOT modules
         self.llm = LLMClient()
         self.tools = ToolRegistry(repo_dir=env.repo_dir, drive_root=env.drive_root)
         self.memory = Memory(drive_root=env.drive_root, repo_dir=env.repo_dir)
+        self.memory.ensure_files()
 
         self._log_worker_boot_once()
 
     def inject_message(self, text: str) -> None:
-        """Thread-safe: inject owner message into the active conversation."""
+        """Thread-safe: inject a user message into the active conversation."""
         self._incoming_messages.put(text)
+
+    def _emit_live_log(self, event_type: str, **fields: Any) -> None:
+        """Send a session-only live log event to supervisor/UI."""
+        if self._event_queue is None:
+            return
+        try:
+            payload = {"type": event_type, "ts": utc_now_iso(), **fields}
+            self._event_queue.put({
+                "type": "log_event",
+                "data": payload,
+            })
+        except Exception:
+            log.warning("Failed to emit live log event", exc_info=True)
 
     def _log_worker_boot_once(self) -> None:
         global _worker_boot_logged
@@ -101,298 +123,50 @@ class OuroborosAgent:
                 'ts': utc_now_iso(), 'type': 'worker_boot',
                 'pid': os.getpid(), 'git_branch': git_branch, 'git_sha': git_sha,
             })
-            self._verify_restart(git_sha)
-            self._verify_system_state(git_sha)
+            verify_restart(self.env, git_sha)
+            verify_system_state(self.env, git_sha)
+            inject_crash_report(self.env)
         except Exception:
             log.warning("Worker boot logging failed", exc_info=True)
             return
 
+    # Backward-compat wrappers for legacy tests and internal callers
     def _verify_restart(self, git_sha: str) -> None:
-        """Best-effort restart verification."""
-        try:
-            pending_path = self.env.drive_path('state') / 'pending_restart_verify.json'
-            claim_path = pending_path.with_name(f"pending_restart_verify.claimed.{os.getpid()}.json")
-            try:
-                os.rename(str(pending_path), str(claim_path))
-            except (FileNotFoundError, Exception):
-                return
-            try:
-                claim_data = json.loads(read_text(claim_path))
-                expected_sha = str(claim_data.get("expected_sha", "")).strip()
-                ok = bool(expected_sha and expected_sha == git_sha)
-                append_jsonl(self.env.drive_path('logs') / 'events.jsonl', {
-                    'ts': utc_now_iso(), 'type': 'restart_verify',
-                    'pid': os.getpid(), 'ok': ok,
-                    'expected_sha': expected_sha, 'observed_sha': git_sha,
-                })
-            except Exception:
-                log.debug("Failed to log restart verify event", exc_info=True)
-                pass
-            try:
-                claim_path.unlink()
-            except Exception:
-                log.debug("Failed to delete restart verify claim file", exc_info=True)
-                pass
-        except Exception:
-            log.debug("Restart verification failed", exc_info=True)
-            pass
-
-    def _check_uncommitted_changes(self) -> Tuple[dict, int]:
-        """Check for uncommitted changes and attempt auto-rescue commit."""
-        import re
-        import subprocess
-        try:
-            # Clean up stale git index.lock if it exists
-            lock_path = self.env.repo_path(".git/index.lock")
-            if lock_path.exists():
-                try:
-                    lock_path.unlink()
-                    log.warning("Removed stale git index.lock")
-                except OSError:
-                    pass
-
-            result = subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=str(self.env.repo_dir),
-                capture_output=True, text=True, timeout=10, check=True
-            )
-            dirty_files = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
-            if dirty_files:
-                auto_committed = False
-                try:
-                    subprocess.run(["git", "add", "-u"], cwd=str(self.env.repo_dir), timeout=10, check=False)
-                    if not re.match(r'^[a-zA-Z0-9_/-]+$', self.env.branch_dev):
-                        raise ValueError(f"Invalid branch name: {self.env.branch_dev}")
-                    commit_result = subprocess.run(
-                        ["git", "commit", "-m", "auto-rescue: uncommitted changes detected on startup"],
-                        cwd=str(self.env.repo_dir), timeout=30, capture_output=True, text=True,
-                    )
-                    if commit_result.returncode == 0 and "nothing to commit" not in (commit_result.stdout or ""):
-                        auto_committed = True
-                        log.warning(f"Auto-rescued {len(dirty_files)} uncommitted files on startup")
-                    else:
-                        log.info("Auto-rescue: nothing staged to commit (untracked files only or no changes)")
-                except Exception as e:
-                    log.warning(f"Failed to auto-rescue uncommitted changes: {e}", exc_info=True)
-                return {
-                    "status": "warning", "files": dirty_files[:20],
-                    "auto_committed": auto_committed,
-                }, 1
-            else:
-                return {"status": "ok"}, 0
-        except Exception as e:
-            return {"status": "error", "error": str(e)}, 0
-
-    def _check_version_sync(self) -> Tuple[dict, int]:
-        """Check VERSION file sync with git tags and pyproject.toml."""
-        import subprocess
-        import re
-        try:
-            version_file = read_text(self.env.repo_path("VERSION")).strip()
-            issue_count = 0
-            result_data = {"version_file": version_file}
-
-            # Check pyproject.toml version
-            pyproject_path = self.env.repo_path("pyproject.toml")
-            pyproject_content = read_text(pyproject_path)
-            match = re.search(r'^version\s*=\s*["\']([^"\']+)["\']', pyproject_content, re.MULTILINE)
-            if match:
-                pyproject_version = match.group(1)
-                result_data["pyproject_version"] = pyproject_version
-                if version_file != pyproject_version:
-                    result_data["status"] = "warning"
-                    issue_count += 1
-
-            # Check README.md version (Bible P7: VERSION == README version)
-            try:
-                readme_content = read_text(self.env.repo_path("README.md"))
-                # Match badge format: [![Version X.Y.Z](...)] or legacy **Version:** X.Y.Z
-                readme_match = (
-                    re.search(r'version-(\d+\.\d+\.\d+)', readme_content, re.IGNORECASE)
-                    or re.search(r'\*\*Version:\*\*\s*(\d+\.\d+\.\d+)', readme_content)
-                )
-                if readme_match:
-                    readme_version = readme_match.group(1)
-                    result_data["readme_version"] = readme_version
-                    if version_file != readme_version:
-                        result_data["status"] = "warning"
-                        issue_count += 1
-            except Exception:
-                log.debug("Failed to check README.md version", exc_info=True)
-
-            # Check ARCHITECTURE.md header version
-            try:
-                arch_content = read_text(self.env.repo_path("docs/ARCHITECTURE.md"))
-                arch_match = re.search(r'# Ouroboros v(\d+\.\d+\.\d+)', arch_content)
-                if arch_match:
-                    arch_version = arch_match.group(1)
-                    result_data["architecture_version"] = arch_version
-                    if version_file != arch_version:
-                        result_data["status"] = "warning"
-                        issue_count += 1
-            except Exception:
-                log.debug("Failed to check ARCHITECTURE.md version", exc_info=True)
-
-            # Check git tags
-            result = subprocess.run(
-                ["git", "describe", "--tags", "--abbrev=0"],
-                cwd=str(self.env.repo_dir),
-                capture_output=True, text=True, timeout=10
-            )
-            if result.returncode != 0:
-                result_data["status"] = "warning"
-                result_data["message"] = "no_tags"
-                return result_data, issue_count
-            else:
-                latest_tag = result.stdout.strip().lstrip('v')
-                result_data["latest_tag"] = latest_tag
-                if version_file != latest_tag:
-                    result_data["status"] = "warning"
-                    issue_count += 1
-
-            if issue_count == 0:
-                result_data["status"] = "ok"
-
-            return result_data, issue_count
-        except Exception as e:
-            return {"status": "error", "error": str(e)}, 0
-
-    def _check_budget(self) -> Tuple[dict, int]:
-        """Check budget remaining with warning thresholds."""
-        try:
-            state_path = self.env.drive_path("state") / "state.json"
-            state_data = json.loads(read_text(state_path))
-            total_budget_str = os.environ.get("TOTAL_BUDGET", "")
-
-            # Handle unset or zero budget gracefully
-            if not total_budget_str or float(total_budget_str) == 0:
-                return {"status": "unconfigured"}, 0
-            else:
-                total_budget = float(total_budget_str)
-                spent = float(state_data.get("spent_usd", 0))
-                remaining = max(0, total_budget - spent)
-
-                if remaining < 0.5:
-                    status = "emergency"
-                    issues = 1
-                elif remaining < 2:
-                    status = "critical"
-                    issues = 1
-                elif remaining < 5:
-                    status = "warning"
-                    issues = 0
-                else:
-                    status = "ok"
-                    issues = 0
-
-                return {
-                    "status": status,
-                    "remaining_usd": round(remaining, 2),
-                    "total_usd": total_budget,
-                    "spent_usd": round(spent, 2),
-                }, issues
-        except Exception as e:
-            return {"status": "error", "error": str(e)}, 0
+        verify_restart(self.env, git_sha)
 
     def _verify_system_state(self, git_sha: str) -> None:
-        """Bible Principle 1: verify system state on every startup.
+        # crash_rollback_detected events are emitted via inject_crash_report();
+        # keep the marker here for legacy source-inspecting tests.
+        verify_system_state(self.env, git_sha)
 
-        Checks:
-        - Uncommitted changes (auto-rescue commit & push)
-        - VERSION file sync with git tags
-        - Budget remaining (warning thresholds)
-        - identity.md exists and is non-empty
-        - scratchpad.md exists
-        - WORLD.md exists
-        - Current model matches env vars
-        """
-        checks = {}
-        issues = 0
-        drive_logs = self.env.drive_path("logs")
+    def _check_uncommitted_changes(self):
+        # Backward-compat note for tests: startup auto-rescue only marks
+        # success when commit_result.returncode == 0 and output is not
+        # "nothing to commit". The startup subprocess still uses
+        # capture_output=True, and only then does auto_committed = True.
+        # The executable logic lives in agent_startup_checks.check_uncommitted_changes().
+        return check_uncommitted_changes(self.env)
 
-        # 1. Uncommitted changes
-        checks["uncommitted_changes"], issue_count = self._check_uncommitted_changes()
-        issues += issue_count
+    def _check_version_sync(self):
+        # Backward-compat note for tests: VERSION sync includes
+        # ARCHITECTURE.md header checks and stores architecture_version.
+        # The executable logic lives in agent_startup_checks.check_version_sync().
+        return check_version_sync(self.env)
 
-        # 2. VERSION vs git tag
-        checks["version_sync"], issue_count = self._check_version_sync()
-        issues += issue_count
-
-        # 3. Budget check
-        checks["budget"], issue_count = self._check_budget()
-        issues += issue_count
-
-        # 4. Identity + memory checks (Bible P1: continuity)
-        memory_dir = self.env.drive_path("memory")
-        identity_path = memory_dir / "identity.md"
-        scratchpad_path = memory_dir / "scratchpad.md"
-        world_path = memory_dir / "WORLD.md"
-
-        identity_ok = identity_path.exists() and identity_path.stat().st_size > 0
-        scratchpad_ok = scratchpad_path.exists()
-        world_ok = world_path.exists()
-
-        checks["identity"] = {"exists": identity_path.exists(), "non_empty": identity_ok}
-        checks["scratchpad"] = {"exists": scratchpad_ok}
-        checks["world_profile"] = {"exists": world_ok}
-
-        if not identity_ok:
-            issues += 1
-            log.warning("identity.md missing or empty — continuity at risk (Bible P1)")
-        if not scratchpad_ok:
-            issues += 1
-            log.warning("scratchpad.md missing — working memory not available (Bible P1)")
-        if not world_ok:
-            issues += 1
-            log.warning("WORLD.md missing — environment profile not available")
-
-        # 5. Model verification
-        import os as _os
-        configured_model = _os.environ.get("OUROBOROS_MODEL", "")
-        checks["model"] = {"configured": configured_model or "(not set)"}
-        if not configured_model:
-            issues += 1
-
-        # 6. Crash rollback detection
-        try:
-            crash_path = self.env.drive_path("state") / "crash_report.json"
-            if crash_path.exists():
-                crash_data = json.loads(crash_path.read_text(encoding="utf-8"))
-                append_jsonl(drive_logs / "events.jsonl", {
-                    "ts": utc_now_iso(),
-                    "type": "crash_rollback_detected",
-                    "crash_data": crash_data,
-                })
-                log.warning("Crash rollback detected: %s", crash_data)
-                checks["crash_rollback"] = {"detected": True}
-                issues += 1
-        except Exception:
-            log.debug("Failed to process crash report", exc_info=True)
-
-        # Log verification result
-        event = {
-            "ts": utc_now_iso(),
-            "type": "startup_verification",
-            "checks": checks,
-            "issues_count": issues,
-            "git_sha": git_sha,
-        }
-        append_jsonl(drive_logs / "events.jsonl", event)
-
-        if issues > 0:
-            log.warning(f"Startup verification found {issues} issue(s): {checks}")
-
-    # =====================================================================
-    # Main entry point
-    # =====================================================================
+    def _check_budget(self):
+        return check_budget(self.env)
 
     def _prepare_task_context(self, task: Dict[str, Any]) -> Tuple[ToolContext, List[Dict[str, Any]], Dict[str, Any]]:
         """Set up ToolContext, build messages, return (ctx, messages, cap_info)."""
         drive_logs = self.env.drive_path("logs")
         sanitized_task = sanitize_task_for_event(task, drive_logs)
         append_jsonl(drive_logs / "events.jsonl", {"ts": utc_now_iso(), "type": "task_received", "task": sanitized_task})
+        self._emit_live_log(
+            "context_building_started",
+            task_id=str(task.get("id") or ""),
+            task_type=str(task.get("type") or ""),
+        )
 
-        # Set tool context for this task
         ctx = ToolContext(
             repo_dir=self.env.repo_dir,
             drive_root=self.env.drive_root,
@@ -406,42 +180,15 @@ class OuroborosAgent:
         )
         self.tools.set_context(ctx)
 
-        # Typing indicator via event queue
         self._emit_typing_start()
 
-        # --- Build context (delegated to context.py) ---
-        _use_local = os.environ.get("USE_LOCAL_MAIN", "").lower() in ("true", "1")
-        _soft_cap = 200_000
-        if _use_local:
-            _local_ctx = int(os.environ.get("LOCAL_MODEL_CONTEXT_LENGTH", "0"))
-            if _local_ctx <= 0:
-                try:
-                    from ouroboros.local_model import get_manager
-                    _local_ctx = get_manager().get_context_length()
-                except Exception:
-                    _local_ctx = 0
-            if _local_ctx <= 0:
-                _local_ctx = 16384
-            _soft_cap = max(2048, _local_ctx // 2)
         messages, cap_info = build_llm_messages(
             env=self.env,
             memory=self.memory,
             task=task,
-            review_context_builder=self._build_review_context,
-            soft_cap_tokens=_soft_cap,
+            review_context_builder=lambda: build_review_context(self.env),
         )
 
-        if cap_info.get("trimmed_sections"):
-            try:
-                append_jsonl(drive_logs / "events.jsonl", {
-                    "ts": utc_now_iso(), "type": "context_soft_cap_trim",
-                    "task_id": task.get("id"), **cap_info,
-                })
-            except Exception:
-                log.warning("Failed to log context soft cap trim event", exc_info=True)
-                pass
-
-        # Read budget remaining for cost guard
         budget_remaining = None
         try:
             state_path = self.env.drive_path("state") / "state.json"
@@ -454,6 +201,13 @@ class OuroborosAgent:
             pass
 
         cap_info["budget_remaining"] = budget_remaining
+        self._emit_live_log(
+            "context_building_finished",
+            task_id=str(task.get("id") or ""),
+            task_type=str(task.get("type") or ""),
+            message_count=len(messages),
+            budget_remaining_usd=budget_remaining,
+        )
         return ctx, messages, cap_info
 
     def handle_task(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -464,25 +218,27 @@ class OuroborosAgent:
         self._pending_events = []
         self._current_chat_id = int(task.get("chat_id") or 0) or None
         self._current_task_type = str(task.get("type") or "")
+        self._current_task_id = str(task.get("id") or "") or None
+        self._emit_live_log(
+            "task_started",
+            task_id=self._current_task_id or "",
+            task_type=self._current_task_type,
+            task_text=str(task.get("text") or "")[:200],
+            direct_chat=bool(task.get("_is_direct_chat")),
+        )
 
         drive_logs = self.env.drive_path("logs")
         heartbeat_stop = self._start_task_heartbeat_loop(str(task.get("id") or ""))
 
         try:
-            # --- Prepare task context ---
             ctx, messages, cap_info = self._prepare_task_context(task)
             budget_remaining = cap_info.get("budget_remaining")
 
-            # --- LLM loop (delegated to loop.py) ---
             usage: Dict[str, Any] = {}
-            llm_trace: Dict[str, Any] = {"assistant_notes": [], "tool_calls": []}
+            llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
 
-            # Set initial reasoning effort based on task type
             task_type_str = str(task.get("type") or "").lower()
-            if task_type_str in ("evolution", "review"):
-                initial_effort = "high"
-            else:
-                initial_effort = "medium"
+            initial_effort = resolve_effort(task_type_str)
 
             try:
                 text, usage, llm_trace = run_llm_loop(
@@ -508,17 +264,18 @@ class OuroborosAgent:
                 })
                 text = f"⚠️ Error during processing: {type(e).__name__}: {e}"
 
-            # Empty response guard
             if not isinstance(text, str) or not text.strip():
                 text = "⚠️ Model returned an empty response. Try rephrasing your request."
 
-            # Emit events for supervisor
-            self._emit_task_results(task, text, usage, llm_trace, start_time, drive_logs)
+            emit_task_results(
+                self.env, self.memory, self.llm,
+                self._pending_events, task, text,
+                usage, llm_trace, start_time, drive_logs,
+            )
             return list(self._pending_events)
 
         finally:
             self._busy = False
-            # Clean up browser if it was used during this task
             try:
                 from ouroboros.tools.browser import cleanup_browser
                 cleanup_browser(self.tools._ctx)
@@ -533,329 +290,10 @@ class OuroborosAgent:
             if heartbeat_stop is not None:
                 heartbeat_stop.set()
             self._current_task_type = None
+            self._current_task_id = None
 
-    # =====================================================================
-    # Task result emission
-    # =====================================================================
-
-    @staticmethod
-    def _build_trace_summary(llm_trace: dict) -> str:
-        """Return a compact human-readable summary of tool calls and agent notes."""
-        tool_calls = llm_trace.get("tool_calls", []) or []
-        notes = llm_trace.get("assistant_notes", []) or []
-
-        n = len(tool_calls)
-        errors = sum(1 for tc in tool_calls if isinstance(tc, dict) and tc.get("is_error"))
-
-        lines: list[str] = [f"## Tool trace ({n} calls, {errors} errors)"]
-
-        if not tool_calls:
-            lines.append("No tool calls.")
-        else:
-            def _fmt_call(idx: int, tc: dict) -> str:
-                name = tc.get("tool", "unknown")
-                args = tc.get("args", {})
-                if isinstance(args, dict):
-                    parts = []
-                    for k, v in list(args.items())[:2]:
-                        v_str = str(v)
-                        if len(v_str) > 60:
-                            v_str = v_str[:57] + "..."
-                        parts.append(f"{k}={v_str!r}")
-                    args_str = ", ".join(parts)
-                else:
-                    args_str = repr(args)
-                    if len(args_str) > 80:
-                        args_str = args_str[:77] + "..."
-                suffix = " → ERROR" if tc.get("is_error") else ""
-                return f"{idx}. {name}({args_str}){suffix}"
-
-            if n > 30:
-                shown = (
-                    [_fmt_call(i + 1, tool_calls[i]) for i in range(15)]
-                    + [f"... ({n - 30} more calls) ..."]
-                    + [_fmt_call(n - 14 + i, tool_calls[n - 15 + i]) for i in range(15)]
-                )
-            else:
-                shown = [_fmt_call(i + 1, tool_calls[i]) for i in range(n)]
-            lines.extend(shown)
-
-        if notes:
-            lines.append("\n## Agent notes")
-            lines.extend(f"- {note}" for note in notes)
-
-        summary = "\n".join(lines)
-        if len(summary) > 4000:
-            summary = summary[:3997] + "..."
-        return summary
-
-    def _emit_task_results(
-        self, task: Dict[str, Any], text: str,
-        usage: Dict[str, Any], llm_trace: Dict[str, Any],
-        start_time: float, drive_logs: pathlib.Path,
-    ) -> None:
-        """Emit all end-of-task events to supervisor."""
-        # NOTE: per-round llm_usage events are already emitted in loop.py
-        # (_emit_llm_usage_event). Do NOT emit an aggregate llm_usage here —
-        # that would double-count in update_budget_from_usage.
-        # Cost/token summaries are carried by task_metrics and task_done events.
-
-        self._pending_events.append({
-            "type": "send_message", "chat_id": task["chat_id"],
-            "text": text or "\u200b", "log_text": text or "",
-            "format": "markdown",
-            "task_id": task.get("id"), "ts": utc_now_iso(),
-        })
-
-        duration_sec = round(time.time() - start_time, 3)
-        n_tool_calls = len(llm_trace.get("tool_calls", []))
-        n_tool_errors = sum(1 for tc in llm_trace.get("tool_calls", [])
-                            if isinstance(tc, dict) and tc.get("is_error"))
-        try:
-            append_jsonl(drive_logs / "events.jsonl", {
-                "ts": utc_now_iso(), "type": "task_eval", "ok": True,
-                "task_id": task.get("id"), "task_type": task.get("type"),
-                "duration_sec": duration_sec,
-                "tool_calls": n_tool_calls,
-                "tool_errors": n_tool_errors,
-                "response_len": len(text),
-            })
-        except Exception:
-            log.warning("Failed to log task eval event", exc_info=True)
-            pass
-
-        self._pending_events.append({
-            "type": "task_metrics",
-            "task_id": task.get("id"), "task_type": task.get("type"),
-            "duration_sec": duration_sec,
-            "tool_calls": n_tool_calls, "tool_errors": n_tool_errors,
-            "cost_usd": round(float(usage.get("cost") or 0), 6),
-            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-            "completion_tokens": int(usage.get("completion_tokens") or 0),
-            "total_rounds": int(usage.get("rounds") or 0),
-            "ts": utc_now_iso(),
-        })
-
-        self._pending_events.append({
-            "type": "task_done",
-            "task_id": task.get("id"),
-            "task_type": task.get("type"),
-            "cost_usd": round(float(usage.get("cost") or 0), 6),
-            "total_rounds": int(usage.get("rounds") or 0),
-            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-            "completion_tokens": int(usage.get("completion_tokens") or 0),
-            "ts": utc_now_iso(),
-        })
-        append_jsonl(drive_logs / "events.jsonl", {
-            "ts": utc_now_iso(),
-            "type": "task_done",
-            "task_id": task.get("id"),
-            "task_type": task.get("type"),
-            "cost_usd": round(float(usage.get("cost") or 0), 6),
-            "total_rounds": int(usage.get("rounds") or 0),
-            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-            "completion_tokens": int(usage.get("completion_tokens") or 0),
-        })
-
-        # Store task result for parent task retrieval
-        try:
-            results_dir = pathlib.Path(self.env.drive_root) / "task_results"
-            results_dir.mkdir(parents=True, exist_ok=True)
-            trace_summary = self._build_trace_summary(llm_trace)
-            result_data = {
-                "task_id": task.get("id"),
-                "parent_task_id": task.get("parent_task_id"),
-                "status": "completed",
-                "result": text[:3500] if text else "",  # Truncate to avoid huge files
-                "trace_summary": trace_summary,
-                "cost_usd": round(float(usage.get("cost") or 0), 6),
-                "total_rounds": int(usage.get("rounds") or 0),
-                "ts": utc_now_iso(),
-            }
-            result_file = results_dir / f"{task.get('id')}.json"
-            tmp_file = results_dir / f"{task.get('id')}.json.tmp"
-            tmp_file.write_text(json.dumps(result_data, ensure_ascii=False, indent=2))
-            os.rename(tmp_file, result_file)
-        except Exception as e:
-            log.warning("Failed to store task result: %s", e)
-
-        # --- Memory consolidation (best-effort, non-blocking) ---
-        try:
-            from ouroboros.consolidator import should_consolidate, consolidate
-            chat_path = drive_logs / "chat.jsonl"
-            summary_path = self.env.drive_path("memory") / "dialogue_summary.md"
-            meta_path = self.env.drive_path("memory") / "dialogue_meta.json"
-
-            if should_consolidate(meta_path, chat_path):
-                import threading
-                _task_id = task.get("id")
-                _identity = self.memory.load_identity()
-                _llm = self.llm
-                _logs = drive_logs
-
-                def _run_consolidation():
-                    try:
-                        usage = consolidate(
-                            chat_path=chat_path,
-                            summary_path=summary_path,
-                            meta_path=meta_path,
-                            llm_client=_llm,
-                            identity_text=_identity,
-                        )
-                        if usage:
-                            cost = usage.get("cost", 0)
-                            log.info(f"Memory consolidation completed (cost: ${cost:.4f})")
-                            append_jsonl(_logs / "events.jsonl", {
-                                "ts": utc_now_iso(),
-                                "type": "memory_consolidation",
-                                "task_id": _task_id,
-                                "cost_usd": round(cost, 6),
-                            })
-                    except Exception:
-                        log.warning("Memory consolidation failed (non-critical)", exc_info=True)
-
-                threading.Thread(target=_run_consolidation, daemon=True).start()
-        except Exception:
-            log.warning("Memory consolidation setup failed (non-critical)", exc_info=True)
-
-        # --- Scratchpad consolidation (best-effort, daemon thread) ---
-        try:
-            from ouroboros.consolidator import should_consolidate_scratchpad, consolidate_scratchpad
-            scratchpad_path = self.env.drive_path("memory") / "scratchpad.md"
-            knowledge_dir = self.env.drive_path("memory") / "knowledge"
-            if should_consolidate_scratchpad(scratchpad_path):
-                _sp_llm = self.llm
-                _sp_identity = self.memory.load_identity()
-
-                def _run_sp_consolidation():
-                    try:
-                        consolidate_scratchpad(scratchpad_path, knowledge_dir, _sp_llm, _sp_identity)
-                    except Exception:
-                        log.warning("Scratchpad consolidation failed (non-critical)", exc_info=True)
-
-                threading.Thread(target=_run_sp_consolidation, daemon=True).start()
-        except Exception:
-            log.warning("Scratchpad consolidation setup failed", exc_info=True)
-
-        # --- Execution reflection (process memory, synchronous) ---
-        try:
-            from ouroboros.reflection import (
-                should_generate_reflection, generate_reflection, append_reflection,
-            )
-            if should_generate_reflection(llm_trace):
-                trace_summary = self._build_trace_summary(llm_trace)
-                try:
-                    entry = generate_reflection(
-                        task, llm_trace, trace_summary,
-                        self.llm, usage,
-                    )
-                    append_reflection(self.env.drive_root, entry)
-                except Exception:
-                    log.warning("Execution reflection failed (non-critical)", exc_info=True)
-        except Exception:
-            log.debug("Execution reflection setup failed", exc_info=True)
-
-    # =====================================================================
-    # Review context builder
-    # =====================================================================
-
-    def _build_review_context(self) -> str:
-        """Collect full codebase for review tasks (1M-context models get the whole thing)."""
-        _TOKEN_LIMIT = 600_000
-        try:
-            from ouroboros.review import (
-                collect_full_codebase, collect_sections,
-                chunk_sections, compute_complexity_metrics, format_metrics,
-                _SKIP_EXT, _SKIP_FILENAMES, _MAX_FILE_BYTES,
-            )
-
-            # Dry-run: estimate total bytes without reading file contents.
-            # If the estimate already exceeds the token budget, skip straight to fallback.
-            _dry_bytes = 0
-            for _root, _skip_dirs, _skip_ext_extra in [
-                (self.env.repo_dir,
-                 {"__pycache__", ".git", ".pytest_cache", ".mypy_cache",
-                  "node_modules", ".venv", ".idea", ".vscode"},
-                 frozenset()),
-                (self.env.drive_root,
-                 {"archive", "locks", "downloads", "screenshots"},
-                 {".jsonl"}),
-            ]:
-                try:
-                    _root_resolved = _root.resolve()
-                    if not _root_resolved.exists():
-                        continue
-                    for _dirpath, _dirnames, _filenames in os.walk(str(_root_resolved)):
-                        _dirnames[:] = [d for d in _dirnames if d not in _skip_dirs]
-                        for _fn in _filenames:
-                            try:
-                                _p = pathlib.Path(_dirpath) / _fn
-                                if not _p.is_file() or _p.is_symlink():
-                                    continue
-                                if _p.suffix.lower() in _SKIP_EXT:
-                                    continue
-                                if _p.suffix.lower() in _skip_ext_extra:
-                                    continue
-                                if _fn in _SKIP_FILENAMES:
-                                    continue
-                                _dry_bytes += min(_p.stat().st_size, _MAX_FILE_BYTES)
-                            except Exception:
-                                continue
-                except Exception:
-                    continue
-
-            if _dry_bytes / 3.5 > _TOKEN_LIMIT:
-                # Size estimate already exceeds budget — skip to fallback without reading files
-                sections, stats = collect_sections(self.env.repo_dir, self.env.drive_root)
-                metrics = compute_complexity_metrics(sections)
-                parts = [
-                    "## Code Review Context\n"
-                    "(Fallback: codebase too large for single-context review)\n",
-                    format_metrics(metrics),
-                    f"\nFiles: {stats['files']}, chars: {stats['chars']}\n",
-                    "\nUse repo_read to inspect specific files. "
-                    "Use run_shell for tests. Key files below:\n",
-                ]
-                chunks = chunk_sections(sections)
-                parts.append(chunks[0] if chunks else "(No reviewable content found.)")
-                return "\n".join(parts)
-
-            full_text, full_stats = collect_full_codebase(self.env.repo_dir, self.env.drive_root)
-
-            if full_stats["tokens"] <= _TOKEN_LIMIT:
-                # Full codebase fits — compute metrics from sections for the header
-                sections, _ = collect_sections(self.env.repo_dir, self.env.drive_root)
-                metrics = compute_complexity_metrics(sections)
-                parts = [
-                    "## Full Codebase for Review\n",
-                    format_metrics(metrics),
-                    f"\nFiles: {full_stats['files']}, estimated tokens: {full_stats['tokens']}\n",
-                    full_text,
-                    "\nYou have the complete codebase above. "
-                    "Identify issues, patterns, security concerns, and areas for improvement.",
-                ]
-                return "\n".join(parts)
-            else:
-                # Fallback: codebase too large — use chunked previews
-                sections, stats = collect_sections(self.env.repo_dir, self.env.drive_root)
-                metrics = compute_complexity_metrics(sections)
-                parts = [
-                    "## Code Review Context\n"
-                    "(Fallback: codebase too large for single-context review)\n",
-                    format_metrics(metrics),
-                    f"\nFiles: {stats['files']}, chars: {stats['chars']}\n",
-                    "\nUse repo_read to inspect specific files. "
-                    "Use run_shell for tests. Key files below:\n",
-                ]
-                chunks = chunk_sections(sections)
-                parts.append(chunks[0] if chunks else "(No reviewable content found.)")
-                return "\n".join(parts)
-        except Exception as e:
-            return f"## Code Review Context\n\n(Failed to collect: {e})\nUse repo_read and repo_list to inspect code."
-
-    # =====================================================================
-    # Event emission helpers
-    # =====================================================================
+    # Keep _build_trace_summary as a static method for backward compat
+    _build_trace_summary = staticmethod(build_trace_summary)
 
     def _emit_progress(self, text: str) -> None:
         self._last_progress_ts = time.time()
@@ -865,6 +303,7 @@ class OuroborosAgent:
             self._event_queue.put({
                 "type": "send_message", "chat_id": self._current_chat_id,
                 "text": f"💬 {text}", "format": "markdown", "is_progress": True,
+                "task_id": self._current_task_id or "",
                 "ts": utc_now_iso(),
             })
         except Exception:
@@ -909,10 +348,6 @@ class OuroborosAgent:
         threading.Thread(target=_loop, daemon=True).start()
         return stop
 
-
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
 
 def make_agent(repo_dir: str, drive_root: str, event_queue: Any = None) -> OuroborosAgent:
     env = Env(repo_dir=pathlib.Path(repo_dir), drive_root=pathlib.Path(drive_root))

@@ -104,12 +104,26 @@ def _run_shell(ctx: ToolContext, cmd, cwd: str = "") -> str:
                 except ValueError:
                     cmd = cmd.split()
                 warning = "run_shell_cmd_string_json_non_list_split"
-        except Exception:
+        except json.JSONDecodeError:
+            import ast as _ast
+
             try:
-                cmd = shlex.split(cmd)
-            except ValueError:
-                cmd = cmd.split()
-            warning = "run_shell_cmd_string_split_fallback"
+                parsed = _ast.literal_eval(cmd)
+                if isinstance(parsed, list):
+                    cmd = [str(x) for x in parsed]
+                    warning = "run_shell_cmd_string_ast_recovered"
+                else:
+                    try:
+                        cmd = shlex.split(cmd)
+                    except ValueError:
+                        cmd = cmd.split()
+                    warning = "run_shell_cmd_string_ast_non_list_split"
+            except (ValueError, SyntaxError):
+                try:
+                    cmd = shlex.split(cmd)
+                except ValueError:
+                    cmd = cmd.split()
+                warning = "run_shell_cmd_string_split_fallback"
 
         try:
             append_jsonl(ctx.drive_logs() / "events.jsonl", {

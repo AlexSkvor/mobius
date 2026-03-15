@@ -1,8 +1,8 @@
 """Multi-model review — sends code/text to multiple LLMs for consensus review.
 
 Also contains the unified pre-commit review gate: three models review staged
-diffs against docs/CHECKLISTS.md before any repo_commit. Critical FAILs block
-before commit; advisory FAILs are attached as warnings.
+diffs against docs/CHECKLISTS.md before any repo_commit. Review always runs
+before commit; enforcement is configurable between blocking and advisory.
 
 BIBLE.md is automatically injected as constitutional context with top priority.
 """
@@ -15,6 +15,7 @@ import pathlib
 from typing import List, Optional
 
 from ouroboros.utils import utc_now_iso, run_cmd, append_jsonl
+from ouroboros import config as _cfg
 from ouroboros.tools.registry import ToolEntry, ToolContext
 
 log = logging.getLogger(__name__)
@@ -48,11 +49,6 @@ err on the side of NOT recommending it and explain the tension.
 
 """
 
-_UNIFIED_REVIEW_MODELS = [
-    "openai/gpt-5.4",
-    "google/gemini-3.1-pro-preview",
-    "anthropic/claude-opus-4.6",
-]
 
 _CHECKLISTS_PATH = pathlib.Path(__file__).resolve().parent.parent.parent / "docs" / "CHECKLISTS.md"
 
@@ -425,115 +421,54 @@ def _build_review_history_section(history: list) -> str:
     return "\n".join(lines)
 
 
-def _run_unified_review(ctx: ToolContext, commit_message: str,
-                        review_rebuttal: str = "",
-                        repo_dir=None) -> Optional[str]:
-    """Unified pre-commit review: 3 models, structured JSON, consistent severity.
+def _single_line(text: str) -> str:
+    return " ".join(str(text or "").split())
 
-    Returns None if all items PASS (commit may proceed), or a blocking error
-    string if any critical FAIL is found.
-    """
-    target_repo = repo_dir or ctx.repo_dir
-    ctx._review_iteration_count += 1
 
-    try:
-        diff_text = run_cmd(["git", "diff", "--cached"], cwd=target_repo)
-    except Exception:
-        diff_text = "(failed to get staged diff)"
+def _append_review_warning(ctx: ToolContext, text: str) -> None:
+    warning = _single_line(text)
+    if warning:
+        ctx._review_advisory.append(warning)
 
-    if not diff_text.strip():
-        return None
 
-    try:
-        changed = run_cmd(["git", "diff", "--cached", "--name-only"], cwd=target_repo)
-    except Exception:
-        changed = ""
+def _handle_review_block_or_warning(
+    ctx: ToolContext,
+    blocking_review: bool,
+    blocked_msg: str,
+    advisory_prefix: str,
+) -> Optional[str]:
+    """Either block immediately or downgrade to advisory warning."""
+    if blocking_review:
+        return blocked_msg
+    _append_review_warning(ctx, advisory_prefix + blocked_msg)
+    ctx._review_iteration_count = 0
+    ctx._review_history = []
+    return None
 
-    preflight_err = _preflight_check(commit_message, changed, target_repo)
-    if preflight_err:
-        return preflight_err
 
-    rebuttal_section = ""
-    if review_rebuttal:
-        rebuttal_section = (
-            "\n## Developer's rebuttal to previous review feedback\n\n"
-            f"{review_rebuttal}\n\n"
-            "Reconsider previous FAIL verdict(s) in light of this argument. "
-            "If the argument is valid, change your verdict to PASS. "
-            "If not, maintain FAIL and explain why.\n"
-        )
+def _build_rebuttal_section(review_rebuttal: str) -> str:
+    if not review_rebuttal:
+        return ""
+    return (
+        "\n## Developer's rebuttal to previous review feedback\n\n"
+        f"{review_rebuttal}\n\n"
+        "Reconsider previous FAIL verdict(s) in light of this argument. "
+        "If the argument is valid, change your verdict to PASS. "
+        "If not, maintain FAIL and explain why.\n"
+    )
 
-    try:
-        checklist_section = _load_checklist_section()
-    except (FileNotFoundError, ValueError) as e:
-        log.error("Checklist loading failed (fail-closed): %s", e)
-        return (
-            "⚠️ REVIEW_BLOCKED: Cannot load review checklist — commit cannot proceed.\n"
-            f"Error: {e}\n"
-            "Ensure docs/CHECKLISTS.md exists and contains the expected section headers."
-        )
 
-    dev_guide_path = pathlib.Path(ctx.repo_dir) / "docs" / "DEVELOPMENT.md"
-    dev_guide_text = ""
+def _load_dev_guide_text(repo_dir: pathlib.Path) -> str:
+    dev_guide_path = repo_dir / "docs" / "DEVELOPMENT.md"
     try:
         if dev_guide_path.exists():
-            dev_guide_text = dev_guide_path.read_text(encoding="utf-8")
+            return dev_guide_path.read_text(encoding="utf-8")
     except Exception:
         pass
+    return ""
 
-    review_history_section = _build_review_history_section(ctx._review_history)
 
-    prompt = _REVIEW_PROMPT_TEMPLATE.format(
-        preamble=_REVIEW_PREAMBLE,
-        checklist_section=checklist_section,
-        dev_guide_text=dev_guide_text or "(DEVELOPMENT.md not found)",
-        commit_message=commit_message[:500],
-        rebuttal_section=rebuttal_section,
-        review_history_section=review_history_section,
-        diff_text=diff_text,
-        changed_files=changed,
-    )
-
-    models_str = os.environ.get("OUROBOROS_REVIEW_MODELS", "")
-    models = (
-        [m.strip() for m in models_str.split(",") if m.strip()]
-        if models_str
-        else list(_UNIFIED_REVIEW_MODELS)
-    )
-
-    try:
-        result_json = _handle_multi_model_review(
-            ctx,
-            content="Review the staged diff and context provided in the instructions above.",
-            prompt=prompt,
-            models=models,
-        )
-        result = json.loads(result_json)
-    except Exception as e:
-        log.error("Unified review infrastructure failure: %s", e)
-        return (
-            "⚠️ REVIEW_BLOCKED: Review infrastructure failed — commit cannot proceed "
-            "without a successful review.\n"
-            f"Error: {e}\n"
-            "Check OPENROUTER_API_KEY, network connectivity, and retry."
-        )
-
-    if "error" in result:
-        log.error("Review returned error: %s", result["error"])
-        return (
-            "⚠️ REVIEW_BLOCKED: Review service returned an error — commit cannot proceed "
-            "without a successful review.\n"
-            f"Error: {result['error']}\n"
-            "Check OPENROUTER_API_KEY, network connectivity, and retry."
-        )
-
-    model_results = result.get("results", [])
-    if not model_results:
-        return (
-            "⚠️ REVIEW_BLOCKED: Review returned no results from any model — "
-            "commit cannot proceed without a successful review."
-        )
-
+def _collect_review_findings(ctx: ToolContext, model_results: list) -> tuple[list[str], list[str], list[str]]:
     critical_fails: List[str] = []
     advisory_warns: List[str] = []
     errored_models: List[str] = []
@@ -580,16 +515,177 @@ def _run_unified_review(ctx: ToolContext, commit_message: str,
             else:
                 advisory_warns.append(desc)
 
+    return critical_fails, advisory_warns, errored_models
+
+
+def _build_critical_block_message(
+    ctx: ToolContext,
+    commit_message: str,
+    critical_fails: List[str],
+    advisory_warns: List[str],
+    errored_note: str,
+) -> str:
+    ctx._review_history.append({
+        "attempt": ctx._review_iteration_count,
+        "commit_message": commit_message[:200],
+        "critical": list(critical_fails),
+        "advisory": list(advisory_warns),
+    })
+
+    iteration_note = f" (attempt {ctx._review_iteration_count})"
+
+    soft_hint = ""
+    if ctx._review_iteration_count >= 5:
+        soft_hint = (
+            "\n\nHint: You have attempted this commit 5+ times. Consider:\n"
+            "- Breaking the change into smaller, independently reviewable commits\n"
+            "- Using review_rebuttal to address specific reviewer concerns"
+        )
+
+    return (
+        f"⚠️ REVIEW_BLOCKED{iteration_note}: Critical issues found by reviewers.\n"
+        "Commit has NOT been created. Fix the issues and try again, or include a\n"
+        "review_rebuttal argument explaining why you disagree.\n\n"
+        + "\n".join(f"  CRITICAL: {f}" for f in critical_fails)
+        + (
+            "\n\nAdvisory warnings:\n"
+            + "\n".join(f"  WARN: {w}" for w in advisory_warns)
+            if advisory_warns else ""
+        )
+        + errored_note
+        + soft_hint
+    )
+
+
+def _run_unified_review(ctx: ToolContext, commit_message: str,
+                        review_rebuttal: str = "",
+                        repo_dir=None) -> Optional[str]:
+    """Unified pre-commit review: 3 models, structured JSON, consistent severity.
+
+    Returns None if commit may proceed. In blocking mode returns a blocking
+    error string when review rejects the commit.
+    """
+    target_repo = repo_dir or ctx.repo_dir
+    ctx._review_iteration_count += 1
+    review_enforcement = _cfg.get_review_enforcement()
+    blocking_review = review_enforcement == "blocking"
+
+    try:
+        diff_text = run_cmd(["git", "diff", "--cached"], cwd=target_repo)
+    except Exception:
+        diff_text = "(failed to get staged diff)"
+
+    if not diff_text.strip():
+        return None
+
+    try:
+        changed = run_cmd(["git", "diff", "--cached", "--name-only"], cwd=target_repo)
+    except Exception:
+        changed = ""
+
+    preflight_err = _preflight_check(commit_message, changed, target_repo)
+    if preflight_err:
+        result = _handle_review_block_or_warning(
+            ctx, blocking_review, preflight_err,
+            "Review enforcement=Advisory: preflight warning did not block commit. ",
+        )
+        if result is not None:
+            return result
+
+    rebuttal_section = _build_rebuttal_section(review_rebuttal)
+
+    try:
+        checklist_section = _load_checklist_section()
+    except (FileNotFoundError, ValueError) as e:
+        log.error("Checklist loading failed (fail-closed): %s", e)
+        blocked_msg = (
+            "⚠️ REVIEW_BLOCKED: Cannot load review checklist — commit cannot proceed.\n"
+            f"Error: {e}\n"
+            "Ensure docs/CHECKLISTS.md exists and contains the expected section headers."
+        )
+        return _handle_review_block_or_warning(
+            ctx, blocking_review, blocked_msg,
+            "Review enforcement=Advisory: review checklist failed to load; commit proceeding anyway. ",
+        )
+
+    dev_guide_text = _load_dev_guide_text(pathlib.Path(ctx.repo_dir))
+
+    review_history_section = _build_review_history_section(ctx._review_history)
+
+    prompt = _REVIEW_PROMPT_TEMPLATE.format(
+        preamble=_REVIEW_PREAMBLE,
+        checklist_section=checklist_section,
+        dev_guide_text=dev_guide_text or "(DEVELOPMENT.md not found)",
+        commit_message=commit_message[:500],
+        rebuttal_section=rebuttal_section,
+        review_history_section=review_history_section,
+        diff_text=diff_text,
+        changed_files=changed,
+    )
+
+    models = _cfg.get_review_models()
+
+    try:
+        result_json = _handle_multi_model_review(
+            ctx,
+            content="Review the staged diff and context provided in the instructions above.",
+            prompt=prompt,
+            models=models,
+        )
+        result = json.loads(result_json)
+    except Exception as e:
+        log.error("Unified review infrastructure failure: %s", e)
+        blocked_msg = (
+            "⚠️ REVIEW_BLOCKED: Review infrastructure failed — commit cannot proceed "
+            "without a successful review.\n"
+            f"Error: {e}\n"
+            "Check OPENROUTER_API_KEY, network connectivity, and retry."
+        )
+        return _handle_review_block_or_warning(
+            ctx, blocking_review, blocked_msg,
+            "Review enforcement=Advisory: review infrastructure failure did not block commit. ",
+        )
+
+    if "error" in result:
+        log.error("Review returned error: %s", result["error"])
+        blocked_msg = (
+            "⚠️ REVIEW_BLOCKED: Review service returned an error — commit cannot proceed "
+            "without a successful review.\n"
+            f"Error: {result['error']}\n"
+            "Check OPENROUTER_API_KEY, network connectivity, and retry."
+        )
+        return _handle_review_block_or_warning(
+            ctx, blocking_review, blocked_msg,
+            "Review enforcement=Advisory: review service error did not block commit. ",
+        )
+
+    model_results = result.get("results", [])
+    if not model_results:
+        blocked_msg = (
+            "⚠️ REVIEW_BLOCKED: Review returned no results from any model — "
+            "commit cannot proceed without a successful review."
+        )
+        return _handle_review_block_or_warning(
+            ctx, blocking_review, blocked_msg,
+            "Review enforcement=Advisory: review returned no model results; commit proceeding anyway. ",
+        )
+
+    critical_fails, advisory_warns, errored_models = _collect_review_findings(ctx, model_results)
+
     models_total = len(model_results)
 
     # Quorum: at least 2 of N reviewers must succeed
     successful_reviewers = models_total - len(errored_models)
     if successful_reviewers < 2:
-        return (
+        blocked_msg = (
             f"⚠️ REVIEW_BLOCKED: Only {successful_reviewers} of {models_total} review "
             f"models responded successfully (minimum 2 required). "
             f"Unavailable: {', '.join(errored_models)}.\n"
             "Retry the commit — transient model failures usually resolve quickly."
+        )
+        return _handle_review_block_or_warning(
+            ctx, blocking_review, blocked_msg,
+            "Review enforcement=Advisory: review quorum failure did not block commit. ",
         )
 
     errored_note = ""
@@ -601,36 +697,21 @@ def _run_unified_review(ctx: ToolContext, commit_message: str,
         )
 
     if critical_fails:
-        ctx._review_history.append({
-            "attempt": ctx._review_iteration_count,
-            "commit_message": commit_message[:200],
-            "critical": list(critical_fails),
-            "advisory": list(advisory_warns),
-        })
-
-        iteration_note = f" (attempt {ctx._review_iteration_count})"
-
-        soft_hint = ""
-        if ctx._review_iteration_count >= 5:
-            soft_hint = (
-                "\n\nHint: You have attempted this commit 5+ times. Consider:\n"
-                "- Breaking the change into smaller, independently reviewable commits\n"
-                "- Using review_rebuttal to address specific reviewer concerns"
+        if blocking_review:
+            return _build_critical_block_message(
+                ctx, commit_message, critical_fails, advisory_warns, errored_note,
             )
 
-        return (
-            f"⚠️ REVIEW_BLOCKED{iteration_note}: Critical issues found by reviewers.\n"
-            "Commit has NOT been created. Fix the issues and try again, or include a\n"
-            "review_rebuttal argument explaining why you disagree.\n\n"
-            + "\n".join(f"  CRITICAL: {f}" for f in critical_fails)
-            + (
-                "\n\nAdvisory warnings:\n"
-                + "\n".join(f"  WARN: {w}" for w in advisory_warns)
-                if advisory_warns else ""
-            )
-            + errored_note
-            + soft_hint
+        _append_review_warning(
+            ctx,
+            "Review enforcement=Advisory: critical review findings did not block commit.",
         )
+        for finding in critical_fails:
+            _append_review_warning(ctx, f"CRITICAL (advisory mode): {finding}")
+        for warning in advisory_warns:
+            _append_review_warning(ctx, f"WARN: {warning}")
+        if errored_note:
+            _append_review_warning(ctx, errored_note)
 
     # All clear — reset iteration state
     ctx._review_iteration_count = 0

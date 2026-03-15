@@ -1,0 +1,177 @@
+"""
+LLM call, retry, pricing, and usage-event logic for the main loop.
+
+Handles model pricing estimation, cost tracking, per-call retry with backoff,
+and real-time usage event emission.
+Extracted from loop.py to keep the main loop orchestrator focused.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import queue
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import logging
+
+from ouroboros.llm import LLMClient, add_usage
+from ouroboros.pricing import emit_llm_usage_event, estimate_cost
+from ouroboros.utils import utc_now_iso, append_jsonl
+
+log = logging.getLogger(__name__)
+
+
+def _emit_live_log(event_queue: Optional[queue.Queue], payload: Dict[str, Any]) -> None:
+    if not event_queue:
+        return
+    try:
+        event_queue.put_nowait({
+            "type": "log_event",
+            "data": {"ts": utc_now_iso(), **payload},
+        })
+    except Exception:
+        log.debug("Failed to emit live LLM log event", exc_info=True)
+
+
+def call_llm_with_retry(
+    llm: LLMClient,
+    messages: List[Dict[str, Any]],
+    model: str,
+    tools: Optional[List[Dict[str, Any]]],
+    effort: str,
+    max_retries: int,
+    drive_logs: pathlib.Path,
+    task_id: str,
+    round_idx: int,
+    event_queue: Optional[queue.Queue],
+    accumulated_usage: Dict[str, Any],
+    task_type: str = "",
+    use_local: bool = False,
+) -> Tuple[Optional[Dict[str, Any]], float]:
+    """
+    Call LLM with retry logic, usage tracking, and event emission.
+
+    Returns:
+        (response_message, cost) on success
+        (None, 0.0) on failure after max_retries
+    """
+    msg = None
+    last_error: Optional[Exception] = None
+
+    for attempt in range(max_retries):
+        try:
+            _emit_live_log(event_queue, {
+                "type": "llm_round_started",
+                "task_id": task_id,
+                "task_type": task_type,
+                "round": round_idx,
+                "attempt": attempt + 1,
+                "model": model,
+                "reasoning_effort": effort,
+                "use_local": bool(use_local),
+            })
+            kwargs = {"messages": messages, "model": model, "reasoning_effort": effort,
+                      "use_local": use_local}
+            if tools:
+                kwargs["tools"] = tools
+            resp_msg, usage = llm.chat(**kwargs)
+            msg = resp_msg
+            add_usage(accumulated_usage, usage)
+
+            cost = float(usage.get("cost") or 0)
+            if not cost:
+                cost = estimate_cost(
+                    model,
+                    int(usage.get("prompt_tokens") or 0),
+                    int(usage.get("completion_tokens") or 0),
+                    int(usage.get("cached_tokens") or 0),
+                    int(usage.get("cache_write_tokens") or 0),
+                )
+
+            category = task_type if task_type in ("evolution", "consciousness", "review", "summarize") else "task"
+            emit_llm_usage_event(event_queue, task_id, model, usage, cost, category)
+
+            tool_calls = msg.get("tool_calls") or []
+            content = msg.get("content")
+            if not tool_calls and (not content or not content.strip()):
+                _emit_live_log(event_queue, {
+                    "type": "llm_round_empty",
+                    "task_id": task_id,
+                    "task_type": task_type,
+                    "round": round_idx,
+                    "attempt": attempt + 1,
+                    "model": model,
+                })
+                log.warning("LLM returned empty response (no content, no tool_calls), attempt %d/%d", attempt + 1, max_retries)
+
+                append_jsonl(drive_logs / "events.jsonl", {
+                    "ts": utc_now_iso(), "type": "llm_empty_response",
+                    "task_id": task_id,
+                    "round": round_idx, "attempt": attempt + 1,
+                    "model": model,
+                    "raw_content": repr(content)[:500] if content else None,
+                    "raw_tool_calls": repr(tool_calls)[:500] if tool_calls else None,
+                    "finish_reason": msg.get("finish_reason") or msg.get("stop_reason"),
+                })
+
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                return None, cost
+
+            accumulated_usage["rounds"] = accumulated_usage.get("rounds", 0) + 1
+
+            _round_event = {
+                "ts": utc_now_iso(), "type": "llm_round",
+                "task_id": task_id,
+                "round": round_idx, "model": model,
+                "reasoning_effort": effort,
+                "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+                "completion_tokens": int(usage.get("completion_tokens") or 0),
+                "cached_tokens": int(usage.get("cached_tokens") or 0),
+                "cache_write_tokens": int(usage.get("cache_write_tokens") or 0),
+                "cost_usd": cost,
+            }
+            _emit_live_log(event_queue, {
+                "type": "llm_round_finished",
+                "task_id": task_id,
+                "task_type": task_type,
+                "round": round_idx,
+                "attempt": attempt + 1,
+                "model": model,
+                "reasoning_effort": effort,
+                "prompt_tokens": _round_event["prompt_tokens"],
+                "completion_tokens": _round_event["completion_tokens"],
+                "cached_tokens": _round_event["cached_tokens"],
+                "cache_write_tokens": _round_event["cache_write_tokens"],
+                "cost_usd": cost,
+                "response_kind": "tool_calls" if tool_calls else "message",
+                "tool_call_count": len(tool_calls),
+                "has_text": bool(content and str(content).strip()),
+            })
+            append_jsonl(drive_logs / "events.jsonl", _round_event)
+            return msg, cost
+
+        except Exception as e:
+            last_error = e
+            _emit_live_log(event_queue, {
+                "type": "llm_round_error",
+                "task_id": task_id,
+                "task_type": task_type,
+                "round": round_idx,
+                "attempt": attempt + 1,
+                "model": model,
+                "error": repr(e),
+            })
+            append_jsonl(drive_logs / "events.jsonl", {
+                "ts": utc_now_iso(), "type": "llm_api_error",
+                "task_id": task_id,
+                "round": round_idx, "attempt": attempt + 1,
+                "model": model, "error": repr(e),
+            })
+            if attempt < max_retries - 1:
+                time.sleep(min(2 ** attempt * 2, 30))
+
+    return None, 0.0

@@ -1,14 +1,16 @@
 """
 Ouroboros — Memory.
 
-Scratchpad, identity, chat history.
+Scratchpad (append-blocks), identity, chat history, dialogue blocks.
 Contract: load scratchpad/identity, chat_history().
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
+import os
 import pathlib
 from collections import Counter
 from typing import Any, Dict, List, Optional
@@ -16,6 +18,8 @@ from typing import Any, Dict, List, Optional
 from ouroboros.utils import utc_now_iso, read_text, write_text, append_jsonl, short
 
 log = logging.getLogger(__name__)
+
+_SCRATCHPAD_MAX_BLOCKS = 10
 
 
 class Memory:
@@ -33,6 +37,9 @@ class Memory:
     def scratchpad_path(self) -> pathlib.Path:
         return self._memory_path("scratchpad.md")
 
+    def scratchpad_blocks_path(self) -> pathlib.Path:
+        return self._memory_path("scratchpad_blocks.json")
+
     def identity_path(self) -> pathlib.Path:
         return self._memory_path("identity.md")
 
@@ -45,9 +52,10 @@ class Memory:
     def logs_path(self, name: str) -> pathlib.Path:
         return (self.drive_root / "logs" / name).resolve()
 
-    # --- Load / save ---
+    # --- Scratchpad: append-block model ---
 
     def load_scratchpad(self) -> str:
+        """Load the auto-generated scratchpad.md for context injection."""
         p = self.scratchpad_path()
         if p.exists():
             return read_text(p)
@@ -55,8 +63,158 @@ class Memory:
         write_text(p, default)
         return default
 
+    def load_scratchpad_blocks(self) -> List[Dict[str, Any]]:
+        """Load raw scratchpad blocks from JSON (file-locked)."""
+        bp = self.scratchpad_blocks_path()
+        if not bp.exists():
+            return []
+        fd = None
+        try:
+            fd = os.open(str(bp), os.O_RDONLY)
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            data = bp.read_text(encoding="utf-8")
+            blocks = json.loads(data) if data.strip() else []
+            return blocks if isinstance(blocks, list) else []
+        except Exception:
+            log.debug("Failed to load scratchpad blocks", exc_info=True)
+            return []
+        finally:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def _migrate_legacy_scratchpad(self) -> None:
+        """One-time migration: seed blocks from existing scratchpad.md if no blocks file exists."""
+        bp = self.scratchpad_blocks_path()
+        if bp.exists():
+            return
+        sp = self.scratchpad_path()
+        if not sp.exists():
+            return
+        content = read_text(sp)
+        if not content.strip():
+            return
+        # Skip migration for default/empty scratchpads
+        if "(empty" in content and "write anything here" in content:
+            return
+        seed = [{"ts": utc_now_iso(), "source": "migration", "content": content}]
+        bp.parent.mkdir(parents=True, exist_ok=True)
+        write_text(bp, json.dumps(seed, ensure_ascii=False, indent=2))
+        log.info("Migrated legacy scratchpad.md (%d chars) to scratchpad_blocks.json", len(content))
+
+    def append_scratchpad_block(self, content: str, source: str = "task") -> Dict[str, Any]:
+        """Append a block to scratchpad. Returns the new block. File-locked, FIFO rotation."""
+        self._migrate_legacy_scratchpad()
+        bp = self.scratchpad_blocks_path()
+        bp.parent.mkdir(parents=True, exist_ok=True)
+
+        new_block = {"ts": utc_now_iso(), "source": source, "content": content}
+
+        fd = None
+        try:
+            fd = os.open(str(bp), os.O_RDWR | os.O_CREAT, 0o644)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+
+            raw = b""
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                raw += chunk
+            text = raw.decode("utf-8", errors="replace").strip()
+            blocks = json.loads(text) if text else []
+            if not isinstance(blocks, list):
+                blocks = []
+
+            blocks.append(new_block)
+            if len(blocks) > _SCRATCHPAD_MAX_BLOCKS:
+                evicted = blocks[:-_SCRATCHPAD_MAX_BLOCKS]
+                for eb in evicted:
+                    append_jsonl(self.journal_path(), {
+                        "ts": utc_now_iso(),
+                        "type": "block_evicted",
+                        "evicted_block_ts": eb.get("ts", ""),
+                        "evicted_block_source": eb.get("source", ""),
+                        "evicted_block_content": eb.get("content", ""),
+                    })
+                blocks = blocks[-_SCRATCHPAD_MAX_BLOCKS:]
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            os.write(fd, json.dumps(blocks, ensure_ascii=False, indent=2).encode("utf-8"))
+        except Exception:
+            log.error("Failed to append scratchpad block", exc_info=True)
+        finally:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+                except OSError:
+                    pass
+
+        self.regenerate_scratchpad_md()
+
+        # Write total scratchpad size to journal for evolution metrics interpolation
+        try:
+            total_chars = sum(len(b.get("content", "")) for b in self.load_scratchpad_blocks())
+            append_jsonl(self.journal_path(), {
+                "ts": utc_now_iso(),
+                "type": "block_appended",
+                "content_len": total_chars,
+            })
+        except Exception:
+            log.debug("Failed to write scratchpad size to journal", exc_info=True)
+
+        return new_block
+
+    def regenerate_scratchpad_md(self) -> None:
+        """Rebuild scratchpad.md from current blocks (newest-first for context)."""
+        blocks = self.load_scratchpad_blocks()
+        if not blocks:
+            write_text(self.scratchpad_path(), self._default_scratchpad())
+            return
+
+        n = len(blocks)
+        parts = [f"## Scratchpad (working memory — {n}/{_SCRATCHPAD_MAX_BLOCKS} blocks)\n"]
+        for block in reversed(blocks):
+            ts = str(block.get("ts", ""))[:16]
+            source = block.get("source", "?")
+            content = block.get("content", "")
+            parts.append(f"### [{ts} — {source}]\n{content}\n\n---\n")
+
+        write_text(self.scratchpad_path(), "\n".join(parts))
+
     def save_scratchpad(self, content: str) -> None:
+        """Legacy full-overwrite (used only by migration/bootstrap)."""
         write_text(self.scratchpad_path(), content)
+
+    # --- Dialogue blocks ---
+
+    def load_dialogue_blocks(self) -> List[Dict[str, Any]]:
+        """Load dialogue_blocks.json (block-wise chat history)."""
+        path = self.drive_root / "memory" / "dialogue_blocks.json"
+        return self._load_json_blocks(path)
+
+    def _load_json_blocks(self, path: pathlib.Path) -> List[Dict[str, Any]]:
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(read_text(path))
+            return data if isinstance(data, list) else []
+        except (json.JSONDecodeError, ValueError):
+            log.warning("Corrupt blocks file %s", path)
+            return []
+
+    @staticmethod
+    def format_blocks_as_markdown(blocks: List[Dict[str, Any]]) -> str:
+        """Format block list into markdown for LLM context."""
+        parts = []
+        for b in blocks:
+            parts.append(b.get("content", ""))
+        return "\n\n".join(parts)
 
     def load_identity(self) -> str:
         p = self.identity_path()
@@ -156,7 +314,7 @@ class Memory:
         if not entries:
             return ""
         lines = []
-        for e in entries[-800:]:
+        for e in entries[-1000:]:
             dir_raw = str(e.get("direction", "")).lower()
             ts_full = e.get("ts", "")
             ts_hhmm = ts_full[11:16] if len(ts_full) >= 16 else ""
@@ -176,7 +334,7 @@ class Memory:
         for e in entries[-limit:]:
             ts_full = e.get("ts", "")
             ts_hhmm = ts_full[11:16] if len(ts_full) >= 16 else ""
-            text = short(str(e.get("text", "")), 300)
+            text = short(str(e.get("text", "")), 800)
             lines.append(f"⚙️ {ts_hhmm} {text}")
         return "\n".join(lines)
 

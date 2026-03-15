@@ -1,4 +1,4 @@
-# Ouroboros v3.24.1 — Architecture & Reference
+# Ouroboros v4.0.9 — Architecture & Reference
 
 This document describes every component, page, button, API endpoint, and data flow.
 It is the single source of truth for how the system works. Keep it updated.
@@ -35,11 +35,11 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on localhost:8765
       ├── llm.py               ← OpenRouter API client
       ├── safety.py            ← Dual-layer LLM security supervisor
       ├── consciousness.py     ← Background thinking loop (with progress emission)
-      ├── consolidator.py      ← Episodic memory consolidation (dialogue_summary.md)
+      ├── consolidator.py      ← Block-wise dialogue consolidation (dialogue_blocks.json)
       ├── memory.py            ← Scratchpad, identity, chat history
       ├── context.py           ← LLM context builder (public API for consciousness)
       ├── review.py            ← Code collection, complexity metrics, full-codebase review
-      ├── owner_inject.py      ← Per-task owner message mailbox (forward_to_worker)
+      ├── owner_inject.py      ← Per-task user message mailbox (compat module name)
       ├── world_profiler.py    ← System profile generator (WORLD.md)
       ├── tools/               ← Auto-discovered tool plugins
       └── ...
@@ -86,19 +86,18 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on localhost:8765
 │   │   └── queue_snapshot.json
 │   ├── memory/
 │   │   ├── identity.md     ← Agent's self-description (persistent)
-│   │   ├── scratchpad.md   ← Working memory (persistent)
-│   │   ├── dialogue_summary.md ← Consolidated chat history (episodic narrative)
+│   │   ├── scratchpad.md   ← Working memory (auto-generated from scratchpad_blocks.json)
+│   │   ├── scratchpad_blocks.json ← Append-block scratchpad (FIFO, max 10)
+│   │   ├── dialogue_blocks.json ← Block-wise consolidated chat history
+│   │   ├── dialogue_summary.md ← Legacy dialogue summary (auto-migrated to blocks)
 │   │   ├── dialogue_meta.json  ← Consolidation metadata (offsets, counts)
 │   │   ├── WORLD.md        ← System profile (generated on first run)
 │   │   ├── knowledge/      ← Structured knowledge base files
 │   │   ├── identity_journal.jsonl    ← Identity update journal
-│   │   ├── scratchpad_journal.jsonl  ← Scratchpad update journal
+│   │   ├── scratchpad_journal.jsonl  ← Scratchpad block eviction journal
 │   │   ├── knowledge_journal.jsonl   ← Knowledge write journal
 │   │   ├── registry.md              ← Source-of-truth awareness map (what data the agent has vs doesn't have)
-│   │   └── owner_mailbox/           ← Per-task owner message files
-│   ├── creator/                       ← User model (structured knowledge for context-aware interaction)
-│   │   ├── _index.md                  ← Summary loaded into LLM context
-│   │   └── *.md                       ← User-defined facet files (topics, preferences, etc.)
+│   │   └── owner_mailbox/           ← Per-task user message files (compat path name)
 │   ├── logs/
 │   │   ├── chat.jsonl      ← Chat message log
 │   │   ├── progress.jsonl  ← Progress/thinking messages (BG consciousness, tasks)
@@ -194,6 +193,14 @@ Navigation is a left sidebar with 8 pages.
   Keys are displayed as masked values (e.g., `sk-or-v1...`).
   Only overwritten on save if user enters a new value (not containing `...`).
 - **Models**: Main, Code, Light, Fallback.
+- **Reasoning Effort**: Four separate dropdowns for task/chat, evolution, review, and consciousness.
+  Backed by `OUROBOROS_EFFORT_TASK`, `OUROBOROS_EFFORT_EVOLUTION`, `OUROBOROS_EFFORT_REVIEW`,
+  `OUROBOROS_EFFORT_CONSCIOUSNESS`. Loading falls back to legacy `OUROBOROS_INITIAL_REASONING_EFFORT`
+  for task/chat when the new key is absent.
+- **Review Models**: Comma-separated OpenRouter model IDs for pre-commit review.
+  Backed by `OUROBOROS_REVIEW_MODELS`.
+- **Review Enforcement**: `Advisory` or `Blocking` for pre-commit review behavior.
+  Backed by `OUROBOROS_REVIEW_ENFORCEMENT`. Review always runs in both modes.
 - **Runtime**: Max Workers, Budget ($), Soft/Hard Timeout.
 - **GitHub**: Token + Repo (for remote sync).
 - **Save Settings** button → POST `/api/settings`. Applies to env immediately.
@@ -209,8 +216,12 @@ Navigation is a left sidebar with 8 pages.
   Toggle on/off to filter log entries.
 - **Clear** button: clears the in-memory log view (not files on disk).
 - Log entries arrive via WebSocket `{type: "log", data: event}`.
-- Each entry shows: timestamp, event type (color-coded), message preview.
-- Click to expand long entries.
+- The page renders a live timeline: timestamp, category, phase badge, readable summary,
+  metadata pills, and optional body text.
+- Each row has a **Raw** toggle that expands the original JSON payload.
+- New live-only timeline events cover task start, context building, LLM round start/finish,
+  tool start/finish/timeout, and compact task heartbeats during long waits.
+- Repeated startup/system events such as verification bursts are compacted in the UI.
 - Max 500 entries in view (oldest removed).
 
 ### 3.5 Versions
@@ -353,9 +364,11 @@ Each iteration (0.5s sleep):
 - **`repo_write_commit`**: legacy single-file write+commit (kept for compatibility).
   Also runs unified review before commit.
 - **Unified pre-commit review** (v3.24.0): 3 models review staged diff against
-  `docs/CHECKLISTS.md`. Critical FAILs block before commit; advisory FAILs shown
-  as warnings. Review history carried across iterations. Quorum: at least 2 of 3
-  reviewers must succeed. Deterministic preflight catches VERSION/README mismatches
+  `docs/CHECKLISTS.md`. Review always runs before commit. `Blocking` mode keeps
+  critical findings as hard gates; `Advisory` mode surfaces the same findings
+  as warnings and lets the commit continue. Review history carried across
+  blocking iterations. Quorum: at least 2 of 3 reviewers must succeed in
+  blocking mode. Deterministic preflight catches VERSION/README mismatches
   before the expensive LLM call.
 - **`pull_from_remote`**: fast-forward only pull from origin
 - **`restore_to_head`**: discard uncommitted changes (review-exempt)
@@ -387,23 +400,26 @@ the constitutional guard is that the file itself must remain non-deletable.
 - **Progress emission**: emits 💬 progress messages to UI via event queue + persists to `progress.jsonl`
 - Pauses when regular task is running; deferred events queued and flushed on resume
 - Budget-capped (default 10% of total)
-- As of v3.16.1, CONSCIOUSNESS.md includes a concrete 7-item rotating maintenance checklist (dialogue consolidation, identity freshness, scratchpad freshness, knowledge gaps, creator model freshness, tech radar, registry sync). One item is addressed per wakeup cycle.
+- As of v3.16.1, CONSCIOUSNESS.md includes a concrete 7-item rotating maintenance checklist (dialogue consolidation, identity freshness, scratchpad freshness, knowledge gaps, process-memory freshness, tech radar, registry sync). One item is addressed per wakeup cycle.
 
-### Episodic memory consolidation (consolidator.py)
+### Block-wise dialogue consolidation (consolidator.py)
 
 - Triggered after each task completion (non-blocking, runs in a daemon thread)
-- Reads unprocessed entries from `chat.jsonl` (offset tracked in `dialogue_meta.json`)
-- Calls lightweight LLM (Gemini Flash) to create episodic narrative summaries
-- Appends episodes to `dialogue_summary.md` with timestamps and open threads
-- **Secondary consolidation**: when `dialogue_summary.md` exceeds 90K chars,
-  oldest episodes are compressed into "era summaries" (30-40% of original)
-- Threshold: minimum 20 new messages before consolidation triggers
-- First-person narrative format ("I did...", "the user asked...", "We decided...")
+- Reads unprocessed entries from `chat.jsonl` in BLOCK_SIZE (100) message chunks
+- Calls LLM (Gemini Flash) to create summary blocks stored in `dialogue_blocks.json`
+- **Era compression**: when block count exceeds MAX_SUMMARY_BLOCKS (10), oldest blocks
+  compressed into single "era summary" (30-40% of original length)
+- **Auto-migration**: legacy `dialogue_summary.md` episodes auto-migrated to blocks
+  on first consolidation run
+- First-person narrative format ("I did...", "Anton asked...", "We decided...")
+- Context reads blocks directly from `dialogue_blocks.json` instead of flat markdown
 
 ### Scratchpad auto-consolidation (consolidator.py)
 
-- Triggered after each task when `scratchpad.md` exceeds 30,000 chars
-- LLM extracts durable insights into knowledge base topics, compresses working memory
+- **Block-aware**: operates on `scratchpad_blocks.json` when blocks exist
+- Triggered after each task when total block content exceeds 30,000 chars
+- LLM extracts durable insights into knowledge base topics, compresses oldest blocks
+- Falls back to flat-file mode for pre-migration scratchpads
 - Writes knowledge files to `memory/knowledge/`, rebuilds `index-full.md`
 - Uses `fcntl` file lock to serialize concurrent calls
 - Runs in a daemon thread (same pattern as dialogue consolidation)
@@ -474,6 +490,12 @@ Settings file: `~/Ouroboros/data/settings.json`. File-locked for concurrent acce
 | OUROBOROS_MAX_WORKERS | 5 | Worker process pool size |
 | TOTAL_BUDGET | 10.0 | Total budget in USD |
 | OUROBOROS_WEBSEARCH_MODEL | gpt-5.2 | OpenAI model for web_search tool |
+| OUROBOROS_REVIEW_MODELS | openai/gpt-5.4,google/gemini-3.1-pro-preview,anthropic/claude-opus-4.6 | Comma-separated OpenRouter model IDs for pre-commit review (min 2 for quorum) |
+| OUROBOROS_REVIEW_ENFORCEMENT | blocking | Pre-commit review enforcement: `advisory` or `blocking` |
+| OUROBOROS_EFFORT_TASK | none | Reasoning effort for task/chat: none, low, medium, high |
+| OUROBOROS_EFFORT_EVOLUTION | high | Reasoning effort for evolution tasks |
+| OUROBOROS_EFFORT_REVIEW | medium | Reasoning effort for review tasks |
+| OUROBOROS_EFFORT_CONSCIOUSNESS | low | Reasoning effort for background consciousness |
 | OUROBOROS_SOFT_TIMEOUT_SEC | 600 | Soft timeout warning (10 min) |
 | OUROBOROS_HARD_TIMEOUT_SEC | 1800 | Hard timeout kill (30 min) |
 | LOCAL_MODEL_SOURCE | "" | HuggingFace repo for local model |
@@ -499,7 +521,7 @@ Settings file: `~/Ouroboros/data/settings.json`. File-locked for concurrent acce
 
 - **ouroboros** — development branch. Agent commits here.
 - **ouroboros-stable** — promoted stable version. Updated via "Promote to Stable" button.
-- **main** — belongs to the creator. Agent never touches it.
+- **main** — protected branch. Agent never touches it.
 
 `safe_restart()` does `git checkout -f ouroboros` + `git reset --hard` on the repo.
 Uncommitted changes are rescued to `~/Ouroboros/data/archive/rescue/` before reset.
@@ -562,7 +584,7 @@ On next manual launch:
 ```
 11. auto_resume_after_restart() checks for panic_stop.flag
 12. Flag found → skip auto-resume, delete flag
-13. Agent waits for owner interaction (no automatic work)
+13. Agent waits for user interaction (no automatic work)
 ```
 
 ### 9.3 Subprocess Process Group Management

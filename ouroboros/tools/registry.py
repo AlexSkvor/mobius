@@ -186,7 +186,7 @@ CORE_TOOL_NAMES = {
     "schedule_task", "wait_for_task", "get_task_result",
     "update_scratchpad", "update_identity",
     "chat_history", "web_search",
-    "send_owner_message", "switch_model",
+    "send_user_message", "switch_model",
     "request_restart", "promote_to_stable",
     "knowledge_read", "knowledge_write", "knowledge_list",
     "browse_page", "browser_action", "analyze_screenshot",
@@ -207,7 +207,7 @@ class ToolRegistry:
 
     _FROZEN_TOOL_MODULES = [
         "browser", "compact_context", "control", "core", "evolution_stats",
-        "git", "github", "health", "knowledge", "review", "search",
+        "git", "github", "health", "knowledge", "memory_tools", "review", "search",
         "shell", "tool_discovery", "vision",
     ]
 

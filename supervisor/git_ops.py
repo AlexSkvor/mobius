@@ -104,30 +104,72 @@ def _ensure_repo_gitignore(repo_dir: pathlib.Path = None) -> None:
         gi.write_text(_REPO_GITIGNORE, encoding="utf-8")
 
 
+def _ensure_git_identity() -> None:
+    """Ensure repo-local git identity exists for local commits/tags."""
+    git_capture(["git", "config", "user.name", "Ouroboros"])
+    git_capture(["git", "config", "user.email", "ouroboros@local.mac"])
+
+
+def _ensure_local_version_tag() -> None:
+    """Create the current VERSION tag locally when a local-only repo has none."""
+    version_path = REPO_DIR / "VERSION"
+    if not version_path.exists():
+        return
+
+    version = version_path.read_text(encoding="utf-8").strip().lstrip("v")
+    if not re.match(r"^\d+\.\d+\.\d+$", version):
+        return
+
+    tag_name = f"v{version}"
+    rc, tag_match, err = git_capture(["git", "tag", "-l", tag_name])
+    if rc != 0:
+        log.warning("Failed to check local tag %s: %s", tag_name, err)
+        return
+    if tag_match.strip():
+        return
+
+    rc, all_tags, err = git_capture(["git", "tag", "-l"])
+    if rc != 0:
+        log.warning("Failed to list local tags: %s", err)
+        return
+    if any(t.strip() for t in all_tags.splitlines()):
+        return
+
+    rc, head_sha, err = git_capture(["git", "rev-parse", "HEAD"])
+    if rc != 0 or not head_sha:
+        log.warning("Cannot create local version tag %s without HEAD: %s", tag_name, err)
+        return
+
+    _ensure_git_identity()
+    rc, _, err = git_capture(["git", "tag", "-a", tag_name, "-m", f"Release {tag_name}"])
+    if rc != 0:
+        log.warning("Failed to create local version tag %s: %s", tag_name, err)
+        return
+
+    log.info("Created local-only version tag %s at %s", tag_name, head_sha[:8])
+
+
 def ensure_repo_present() -> None:
     if not (REPO_DIR / ".git").exists():
-        if REPO_DIR.exists():
-            shutil.rmtree(REPO_DIR, ignore_errors=True)
+        # REPO_DIR is the working code directory - never rm -rf it.
+        # Just initialize git in-place over the existing files.
         REPO_DIR.mkdir(parents=True, exist_ok=True)
         _ensure_repo_gitignore()
         import dulwich.repo
         dulwich.repo.Repo.init(str(REPO_DIR))
-        
-        subprocess.run(["git", "config", "user.name", "Ouroboros"], cwd=str(REPO_DIR), check=True)
-        subprocess.run(["git", "config", "user.email", "ouroboros@localhost"], cwd=str(REPO_DIR), check=True)
-        
+
+        _ensure_git_identity()
+
         rc, _, _ = git_capture(["git", "status", "--porcelain"])
         if rc == 0:
             subprocess.run(["git", "add", "-A"], cwd=str(REPO_DIR), check=True)
             subprocess.run(["git", "commit", "-m", "Initial commit from bundle"], cwd=str(REPO_DIR), check=False)
-            
+
         # Create branches
         subprocess.run(["git", "branch", "-M", BRANCH_DEV], cwd=str(REPO_DIR), check=False)
         subprocess.run(["git", "branch", BRANCH_STABLE], cwd=str(REPO_DIR), check=False)
-        
-    else:
-        # We are completely local now, no remote to update
-        pass
+
+    _ensure_local_version_tag()
 
 
 # ---------------------------------------------------------------------------

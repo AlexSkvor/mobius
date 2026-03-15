@@ -96,7 +96,7 @@ EXPECTED_TOOLS = [
     "request_restart", "promote_to_stable", "request_review",
     "schedule_task", "cancel_task",
     "switch_model", "toggle_evolution", "toggle_consciousness",
-    "send_owner_message", "send_photo",
+    "send_user_message", "send_photo",
     "codebase_digest", "codebase_health",
     "knowledge_read", "knowledge_write", "knowledge_list",
     # Memory registry
@@ -151,6 +151,17 @@ def test_tool_execute_basic(registry):
     result = registry.execute("run_shell", {"cmd": "echo hello"})
     assert isinstance(result, str), "Tool execute should return string"
     assert "hello" in result.lower() or "⚠️" in result, "Should return output or error"
+
+
+def test_frozen_registry_includes_memory_tools(monkeypatch):
+    """Frozen-mode registry must still load memory registry tools."""
+    from ouroboros.tools.registry import ToolRegistry
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    registry = ToolRegistry(repo_dir=tmp, drive_root=tmp)
+    available = {t["function"]["name"] for t in registry.schemas()}
+    assert "memory_map" in available
+    assert "memory_update_registry" in available
 
 
 # ── Utilities ────────────────────────────────────────────────────

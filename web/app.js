@@ -26,7 +26,7 @@ const state = {
     messages: [],
     logs: [],
     dashboard: {},
-    activeFilters: { tools: true, llm: true, errors: true, tasks: true, system: false, consciousness: false },
+    activeFilters: { tools: true, llm: true, errors: true, tasks: true, system: true, consciousness: true },
     unreadCount: 0,
     activePage: 'chat',
 };

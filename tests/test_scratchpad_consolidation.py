@@ -14,6 +14,8 @@ import tempfile
 
 import pytest
 
+from ouroboros.memory import Memory
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -31,27 +33,33 @@ def test_consolidation_threshold_is_30000():
     )
 
 
-def test_should_not_consolidate_small_scratchpad():
+def test_should_not_consolidate_small_scratchpad(tmp_path):
     mod = _get_consolidator()
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-        f.write("x" * 10000)
-        f.flush()
-        assert not mod.should_consolidate_scratchpad(pathlib.Path(f.name))
-    os.unlink(f.name)
+    drive = tmp_path / "data"
+    (drive / "memory").mkdir(parents=True)
+    (drive / "logs").mkdir(parents=True)
+    mem = Memory(drive_root=drive)
+    mem.scratchpad_path().write_text("x" * 10000)
+    assert not mod.should_consolidate_scratchpad(mem)
 
 
-def test_should_consolidate_large_scratchpad():
+def test_should_consolidate_large_scratchpad(tmp_path):
     mod = _get_consolidator()
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-        f.write("x" * 35000)
-        f.flush()
-        assert mod.should_consolidate_scratchpad(pathlib.Path(f.name))
-    os.unlink(f.name)
+    drive = tmp_path / "data"
+    (drive / "memory").mkdir(parents=True)
+    (drive / "logs").mkdir(parents=True)
+    mem = Memory(drive_root=drive)
+    mem.scratchpad_path().write_text("x" * 35000)
+    assert mod.should_consolidate_scratchpad(mem)
 
 
-def test_should_not_consolidate_missing_file():
+def test_should_not_consolidate_missing_file(tmp_path):
     mod = _get_consolidator()
-    assert not mod.should_consolidate_scratchpad(pathlib.Path("/tmp/nonexistent_scratchpad.md"))
+    drive = tmp_path / "data"
+    (drive / "memory").mkdir(parents=True)
+    (drive / "logs").mkdir(parents=True)
+    mem = Memory(drive_root=drive)
+    assert not mod.should_consolidate_scratchpad(mem)
 
 
 def test_rebuild_knowledge_index_exists():
@@ -90,11 +98,18 @@ def test_rebuild_knowledge_index_skips_underscore_files():
         assert "visible" in index_text
 
 
-def test_consolidate_scratchpad_calls_index_rebuild():
-    """Scratchpad consolidation pipeline must call _rebuild_knowledge_index."""
+def test_consolidate_scratchpad_flat_calls_index_rebuild():
+    """Flat scratchpad consolidation pipeline must call _rebuild_knowledge_index."""
     mod = _get_consolidator()
-    source = inspect.getsource(mod._consolidate_scratchpad_locked)
+    source = inspect.getsource(mod._consolidate_scratchpad_flat)
     assert "_rebuild_knowledge_index" in source, (
         "scratchpad consolidation does not call _rebuild_knowledge_index — "
         "auto-extracted knowledge won't appear in context"
     )
+
+
+def test_consolidate_scratchpad_blocks_calls_index_rebuild():
+    """Block-aware scratchpad consolidation must also call _rebuild_knowledge_index."""
+    mod = _get_consolidator()
+    source = inspect.getsource(mod._consolidate_scratchpad_blocks)
+    assert "_rebuild_knowledge_index" in source

@@ -258,8 +258,9 @@ class TestReviewHistoryBuilding:
 
 class TestReviewQuorumLogic:
     def test_review_models_configured(self):
-        review = _get_review_module()
-        assert len(review._UNIFIED_REVIEW_MODELS) == 3
+        from ouroboros.config import get_review_models
+        models = get_review_models()
+        assert len(models) >= 2  # config.py is single source of truth
 
     def test_checklist_path_exists(self):
         review = _get_review_module()
@@ -270,6 +271,109 @@ class TestReviewQuorumLogic:
         section = review._load_checklist_section()
         assert "bible_compliance" in section
         assert "code_quality" in section
+
+
+class TestReviewEnforcementModes:
+    @staticmethod
+    def _fake_result(*review_texts):
+        return json.dumps({
+            "results": [
+                {
+                    "model": f"model-{idx}",
+                    "verdict": "PASS",
+                    "text": text,
+                    "tokens_in": 0,
+                    "tokens_out": 0,
+                    "cost_estimate": 0.0,
+                }
+                for idx, text in enumerate(review_texts, start=1)
+            ]
+        })
+
+    @staticmethod
+    def _mock_staged(monkeypatch, review_mod, changed_files="x.py", diff_text="diff --cached"):
+        def _fake_run_cmd(cmd, cwd=None):
+            cmd = list(cmd)
+            if cmd[:4] == ["git", "diff", "--cached", "--name-only"]:
+                return changed_files
+            if cmd[:3] == ["git", "diff", "--cached"]:
+                return diff_text
+            return ""
+        monkeypatch.setattr(review_mod, "run_cmd", _fake_run_cmd)
+
+    def test_blocking_mode_blocks_critical_findings(self, tmp_path, monkeypatch):
+        review = _get_review_module()
+        ctx = _make_ctx(tmp_path)
+        self._mock_staged(monkeypatch, review, changed_files="x.py")
+        monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
+        monkeypatch.setattr(
+            review,
+            "_handle_multi_model_review",
+            lambda *args, **kwargs: self._fake_result(
+                '[{"item":"code_quality","verdict":"FAIL","severity":"critical","reason":"broken"}]',
+                '[{"item":"code_quality","verdict":"PASS","severity":"critical","reason":"ok"}]',
+            ),
+        )
+        result = review._run_unified_review(ctx, "test commit", repo_dir=ctx.repo_dir)
+        assert result is not None
+        assert "REVIEW_BLOCKED" in result
+
+    def test_advisory_mode_downgrades_critical_findings(self, tmp_path, monkeypatch):
+        review = _get_review_module()
+        ctx = _make_ctx(tmp_path)
+        self._mock_staged(monkeypatch, review, changed_files="x.py")
+        monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
+        monkeypatch.setattr(
+            review,
+            "_handle_multi_model_review",
+            lambda *args, **kwargs: self._fake_result(
+                '[{"item":"code_quality","verdict":"FAIL","severity":"critical","reason":"broken"}]',
+                '[{"item":"code_quality","verdict":"PASS","severity":"critical","reason":"ok"}]',
+            ),
+        )
+        result = review._run_unified_review(ctx, "test commit", repo_dir=ctx.repo_dir)
+        assert result is None
+        assert any("critical review findings did not block commit" in w.lower() for w in ctx._review_advisory)
+        assert any("broken" in w for w in ctx._review_advisory)
+        assert ctx._review_iteration_count == 0
+
+    def test_advisory_mode_downgrades_quorum_failure(self, tmp_path, monkeypatch):
+        review = _get_review_module()
+        ctx = _make_ctx(tmp_path)
+        self._mock_staged(monkeypatch, review, changed_files="x.py")
+        monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
+        monkeypatch.setattr(
+            review,
+            "_handle_multi_model_review",
+            lambda *args, **kwargs: self._fake_result(
+                "Error: timeout",
+                '[{"item":"code_quality","verdict":"PASS","severity":"critical","reason":"ok"}]',
+            ),
+        )
+        result = review._run_unified_review(ctx, "test commit", repo_dir=ctx.repo_dir)
+        assert result is None
+        assert any(
+            "only 1 of 2 review models responded successfully" in w.lower()
+            or "review enforcement=advisory" in w.lower()
+            for w in ctx._review_advisory
+        )
+
+    def test_advisory_mode_keeps_preflight_as_warning(self, tmp_path, monkeypatch):
+        review = _get_review_module()
+        ctx = _make_ctx(tmp_path)
+        self._mock_staged(monkeypatch, review, changed_files="VERSION")
+        monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
+        monkeypatch.setattr(
+            review,
+            "_handle_multi_model_review",
+            lambda *args, **kwargs: self._fake_result(
+                '[{"item":"version_bump","verdict":"PASS","severity":"critical","reason":"ok"}]',
+                '[{"item":"readme_changelog","verdict":"PASS","severity":"critical","reason":"ok"}]',
+            ),
+        )
+        result = review._run_unified_review(ctx, "version update", repo_dir=ctx.repo_dir)
+        assert result is None
+        assert any("preflight warning did not block commit" in w.lower() for w in ctx._review_advisory)
 
 
 # --- Unified review wired into commit functions ---

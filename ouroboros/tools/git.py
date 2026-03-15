@@ -2,8 +2,8 @@
 pull_from_remote, restore_to_head, revert_commit.
 
 Includes unified pre-commit review per Bible P8: three models review the staged
-diff in parallel using a structured JSON checklist. Critical FAILs block before
-commit; advisory FAILs are attached as warnings.
+diff in parallel using a structured JSON checklist. Review always runs before
+commit; enforcement is configurable between blocking and advisory.
 """
 
 from __future__ import annotations
@@ -199,7 +199,6 @@ from ouroboros.tools.review import (  # noqa: F401
     _run_unified_review,
     _load_checklist_section,
     _CHECKLISTS_PATH,
-    _UNIFIED_REVIEW_MODELS,
     _parse_review_json,
 )
 
@@ -353,7 +352,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                        paths: Optional[List[str]] = None,
                        skip_tests: bool = False,
                        review_rebuttal: str = "") -> str:
-    """Stage, review, and commit files. Unified pre-commit review blocks on critical issues."""
+    """Stage, review, and commit files with unified pre-commit review."""
     ctx.last_push_succeeded = False
     ctx._review_advisory = []
     if not commit_message.strip():
@@ -694,7 +693,7 @@ def get_tools() -> List[ToolEntry]:
             "name": "repo_commit",
             "description": (
                 "Commit already-changed files. Includes unified pre-commit multi-model review "
-                "(blocks on critical issues before commit)."
+                "before commit, with configurable Advisory/Blocking enforcement."
             ),
             "parameters": {"type": "object", "properties": {
                 "commit_message": {"type": "string"},

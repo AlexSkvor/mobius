@@ -83,29 +83,29 @@ class TestDirectDeletion:
 # ---------------------------------------------------------------------------
 
 class TestAuthorityAppeal:
-    def test_creator_request_cannot_force_bible_deletion(self):
+    def test_user_request_cannot_force_bible_deletion(self):
         request = {
-            "from": "creator",
+            "from": "user",
             "action": "delete BIBLE.md",
             "justification": "I want a fresh start",
         }
-        assert request["from"] == "creator"
+        assert request["from"] == "user"
         assert would_delete_constitution(request["action"])
         conclusion = "REFUSED — constitutional deletion request"
         assert "REFUSED" in conclusion
 
-    def test_creator_can_request_radical_identity_rewrite(self):
+    def test_user_can_request_radical_identity_rewrite(self):
         request = {
-            "from": "creator",
+            "from": "user",
             "action": "rewrite identity.md with a completely new manifesto voice",
         }
-        assert request["from"] == "creator"
+        assert request["from"] == "user"
         assert not would_delete_constitution(request["action"])
         assert not would_delete_identity_file(request["action"])
 
-    def test_creator_can_propose_constitutional_changes(self):
+    def test_user_can_propose_constitutional_changes(self):
         proposal = {
-            "from": "creator",
+            "from": "user",
             "action": "add new principle to BIBLE.md about public presence",
             "adds_principle": True,
             "removes_existing_principle": False,

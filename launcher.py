@@ -330,12 +330,12 @@ def bootstrap_repo() -> None:
             "repo", "data", "build", "dist", ".git", "__pycache__", "venv", ".venv",
             "Ouroboros.spec", "run_demo.sh", "demo_app.py", "app.py", "launcher.py",
             "colab_launcher.py", "colab_bootstrap_shim.py",
-            "python-standalone", "assets",
+            "python-standalone",
             "*.pyc", "*.pyo", "*.so", "*.dylib", "*.dll",
             "*.dist-info", "base_library.zip",
         ))
     else:
-        for item in ("server.py", "web"):
+        for item in ("server.py", "web", "assets"):
             src = bundle_dir / item
             dst = REPO_DIR / item
             if src.exists() and not dst.exists():
@@ -350,7 +350,7 @@ def bootstrap_repo() -> None:
         try:
             _hidden_run(["git", "init"], cwd=str(REPO_DIR), check=True, capture_output=True)
             _hidden_run(["git", "config", "user.name", "Ouroboros"], cwd=str(REPO_DIR), check=True, capture_output=True)
-            _hidden_run(["git", "config", "user.email", "ouroboros@localhost"], cwd=str(REPO_DIR), check=True, capture_output=True)
+            _hidden_run(["git", "config", "user.email", "ouroboros@local.mac"], cwd=str(REPO_DIR), check=True, capture_output=True)
             _hidden_run(["git", "add", "-A"], cwd=str(REPO_DIR), check=True, capture_output=True)
             _hidden_run(["git", "commit", "-m", "Initial commit from app bundle"], cwd=str(REPO_DIR), check=False, capture_output=True)
             _hidden_run(["git", "branch", "-M", "ouroboros"], cwd=str(REPO_DIR), check=False, capture_output=True)

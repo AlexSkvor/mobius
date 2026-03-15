@@ -9,7 +9,7 @@ The consciousness:
 - Loads scratchpad, identity, recent events
 - Calls the LLM with a lightweight introspection prompt
 - Has access to a subset of tools (memory, messaging, scheduling)
-- Can message the owner proactively
+- Can message the user proactively
 - Can schedule tasks for itself
 - Pauses when a regular task is running
 """
@@ -27,10 +27,12 @@ import time
 import traceback
 from typing import Any, Callable, Dict, List, Optional
 
+from ouroboros.loop_tool_execution import StatefulToolExecutor, _truncate_tool_result
 from ouroboros.utils import (
     utc_now_iso, read_text, append_jsonl, clip_text,
     truncate_for_log, sanitize_tool_result_for_log, sanitize_tool_args_for_log,
 )
+from ouroboros.config import resolve_effort
 from ouroboros.llm import LLMClient, DEFAULT_LIGHT_MODEL
 from ouroboros.memory import Memory
 from ouroboros.context import (
@@ -56,7 +58,7 @@ class BackgroundConsciousness:
         self._event_queue = event_queue
         self._owner_chat_id_fn = owner_chat_id_fn
 
-        self._max_bg_rounds = int(os.environ.get("OUROBOROS_BG_MAX_ROUNDS", "5"))
+        self._max_bg_rounds = int(os.environ.get("OUROBOROS_BG_MAX_ROUNDS", "10"))
         self._wakeup_min = int(os.environ.get("OUROBOROS_BG_WAKEUP_MIN", "30"))
         self._wakeup_max = int(os.environ.get("OUROBOROS_BG_WAKEUP_MAX", "7200"))
 
@@ -70,6 +72,7 @@ class BackgroundConsciousness:
         self._next_wakeup_sec: float = 300.0
         self._observations: queue.Queue = queue.Queue(maxsize=100)
         self._deferred_events: list = []
+        self._tool_executor = StatefulToolExecutor()
 
         # Budget tracking
         self._bg_spent_usd: float = 0.0
@@ -105,6 +108,10 @@ class BackgroundConsciousness:
         self._running = False
         self._stop_event.set()
         self._wakeup_event.set()  # Unblock sleep
+        try:
+            self._tool_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            log.debug("Failed to shutdown consciousness tool executor", exc_info=True)
         return "Background consciousness stopping."
 
     def pause(self) -> None:
@@ -126,6 +133,23 @@ class BackgroundConsciousness:
             self._observations.put_nowait(text)
         except queue.Full:
             pass
+
+    def _emit_live_log(self, event_type: str, **fields: Any) -> None:
+        if self._event_queue is None:
+            return
+        try:
+            self._event_queue.put({
+                "type": "log_event",
+                "data": {
+                    "type": event_type,
+                    "ts": utc_now_iso(),
+                    "task_id": "bg-consciousness",
+                    "task_type": "consciousness",
+                    **fields,
+                },
+            })
+        except Exception:
+            log.debug("Failed to emit consciousness live log", exc_info=True)
 
     # -------------------------------------------------------------------
     # Main loop
@@ -200,11 +224,19 @@ class BackgroundConsciousness:
                 if self._paused:
                     break
                 _use_local_light = os.environ.get("USE_LOCAL_LIGHT", "").lower() in ("true", "1")
+                self._emit_live_log(
+                    "llm_round_started",
+                    round=round_idx,
+                    attempt=1,
+                    model=model,
+                    reasoning_effort="low",
+                    use_local=bool(_use_local_light),
+                )
                 msg, usage = self._llm.chat(
                     messages=messages,
                     model=model,
                     tools=tools,
-                    reasoning_effort="low",
+                    reasoning_effort=resolve_effort("consciousness"),
                     max_tokens=2048,
                     use_local=_use_local_light,
                 )
@@ -239,6 +271,21 @@ class BackgroundConsciousness:
 
                 content = msg.get("content") or ""
                 tool_calls = msg.get("tool_calls") or []
+                self._emit_live_log(
+                    "llm_round_finished",
+                    round=round_idx,
+                    attempt=1,
+                    model=model,
+                    reasoning_effort="low",
+                    prompt_tokens=int(usage.get("prompt_tokens") or 0),
+                    completion_tokens=int(usage.get("completion_tokens") or 0),
+                    cached_tokens=int(usage.get("cached_tokens") or 0),
+                    cache_write_tokens=int(usage.get("cache_write_tokens") or 0),
+                    cost_usd=cost,
+                    response_kind="tool_calls" if tool_calls else "message",
+                    tool_call_count=len(tool_calls),
+                    has_text=bool(content.strip()),
+                )
 
                 self._emit_progress(content)
 
@@ -284,6 +331,7 @@ class BackgroundConsciousness:
             })
 
         except Exception as e:
+            self._emit_live_log("llm_round_error", round=round_idx, model=model, error=repr(e))
             append_jsonl(self._drive_root / "logs" / "events.jsonl", {
                 "ts": utc_now_iso(),
                 "type": "consciousness_llm_error",
@@ -304,6 +352,7 @@ class BackgroundConsciousness:
             "content": content.strip(),
             "is_progress": True,
         }
+        persist_locally = self._event_queue is None or chat_id is None
         # 1. UI event queue (only if we have a chat_id)
         if self._event_queue is not None and chat_id is not None:
             try:
@@ -313,8 +362,10 @@ class BackgroundConsciousness:
                     self._event_queue.put(entry)
             except Exception:
                 log.warning("Failed to emit progress event", exc_info=True)
-        # 2. Persist to progress.jsonl
-        append_jsonl(self._drive_root / "logs" / "progress.jsonl", entry)
+                persist_locally = False
+        # 2. Persist directly only when the event will not go through supervisor
+        if persist_locally:
+            append_jsonl(self._drive_root / "logs" / "progress.jsonl", entry)
 
     # -------------------------------------------------------------------
     # Context building (lightweight)
@@ -349,6 +400,13 @@ class BackgroundConsciousness:
             kb_index = kb_index_path.read_text(encoding="utf-8")
             if kb_index.strip():
                 parts.append("## Knowledge base\n\n" + clip_text(kb_index, 50000))
+
+        # Pattern register (P9 Spiral Growth)
+        patterns_path = env.drive_path("memory/knowledge/patterns.md")
+        if patterns_path.exists():
+            patterns_text = patterns_path.read_text(encoding="utf-8")
+            if patterns_text.strip():
+                parts.append("## Pattern Register\n\n" + clip_text(patterns_text, 30000))
 
         # Drive state
         state_json = safe_read(env.drive_path("state/state.json"), fallback="{}")
@@ -392,7 +450,7 @@ class BackgroundConsciousness:
 
     _BG_TOOL_WHITELIST = frozenset({
         # Memory & identity
-        "send_owner_message", "schedule_task", "update_scratchpad",
+        "send_user_message", "schedule_task", "update_scratchpad",
         "update_identity", "set_next_wakeup",
         # Knowledge base
         "knowledge_read", "knowledge_write", "knowledge_list",
@@ -443,14 +501,21 @@ class BackgroundConsciousness:
         except (json.JSONDecodeError, ValueError):
             return "Failed to parse arguments."
 
-        # Set chat_id context for send_owner_message
+        self._emit_live_log(
+            "tool_call_started",
+            tool=fn_name,
+            args=sanitize_tool_args_for_log(fn_name, args if isinstance(args, dict) else {}),
+            timeout_sec=self._registry.get_timeout(fn_name),
+        )
+
         chat_id = self._owner_chat_id_fn()
         self._registry._ctx.current_chat_id = chat_id
         self._registry._ctx.pending_events = []
 
-        timeout_sec = 30
+        timeout_sec = self._registry.get_timeout(fn_name)
         result = None
         error = None
+        timed_out = False
 
         def _run_tool():
             nonlocal result, error
@@ -459,22 +524,34 @@ class BackgroundConsciousness:
             except Exception as e:
                 error = e
 
-        # Execute with timeout using ThreadPoolExecutor
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_run_tool)
-            try:
-                future.result(timeout=timeout_sec)
-            except concurrent.futures.TimeoutError:
-                result = f"[TIMEOUT after {timeout_sec}s]"
-                append_jsonl(self._drive_root / "logs" / "events.jsonl", {
-                    "ts": utc_now_iso(),
-                    "type": "consciousness_tool_timeout",
-                    "tool": fn_name,
-                    "timeout_sec": timeout_sec,
-                })
+        future = self._tool_executor.submit(_run_tool)
+        try:
+            future.result(timeout=timeout_sec)
+        except (TimeoutError, concurrent.futures.TimeoutError):
+            self._tool_executor.reset()
+            timed_out = True
+            result = f"[TIMEOUT after {timeout_sec}s]"
+            self._emit_live_log(
+                "tool_call_timeout",
+                tool=fn_name,
+                args=sanitize_tool_args_for_log(fn_name, args if isinstance(args, dict) else {}),
+                timeout_sec=timeout_sec,
+            )
+            append_jsonl(self._drive_root / "logs" / "events.jsonl", {
+                "ts": utc_now_iso(),
+                "type": "consciousness_tool_timeout",
+                "tool": fn_name,
+                "timeout_sec": timeout_sec,
+            })
 
-        # Handle errors
         if error is not None:
+            self._emit_live_log(
+                "tool_call_finished",
+                tool=fn_name,
+                args=sanitize_tool_args_for_log(fn_name, args if isinstance(args, dict) else {}),
+                is_error=True,
+                result_preview=repr(error),
+            )
             append_jsonl(self._drive_root / "logs" / "events.jsonl", {
                 "ts": utc_now_iso(),
                 "type": "consciousness_tool_error",
@@ -483,15 +560,24 @@ class BackgroundConsciousness:
             })
             result = f"Error: {repr(error)}"
 
-        # Accumulate pending events to the shared list
         for evt in self._registry._ctx.pending_events:
             all_pending_events.append(evt)
 
-        # Truncate result to 15000 chars (same as agent limit)
-        result_str = str(result)[:15000]
+        result_str = _truncate_tool_result(
+            result,
+            tool_name=fn_name,
+            tool_args=args if isinstance(args, dict) else {},
+        )
 
-        # Log to tools.jsonl (same format as loop.py)
         args_for_log = sanitize_tool_args_for_log(fn_name, args)
+        if error is None and result is not None and not timed_out:
+            self._emit_live_log(
+                "tool_call_finished",
+                tool=fn_name,
+                args=args_for_log,
+                is_error=False,
+                result_preview=sanitize_tool_result_for_log(truncate_for_log(result_str, 500)),
+            )
         append_jsonl(self._drive_root / "logs" / "tools.jsonl", {
             "ts": utc_now_iso(),
             "tool": fn_name,

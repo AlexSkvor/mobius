@@ -2,8 +2,9 @@
 """PyInstaller spec for Ouroboros (macOS, Linux, Windows).
 
 Bundles launcher.py as the entry point. The agent code (server.py, ouroboros/,
-supervisor/, web/) is included as data and copied to ~/Ouroboros/repo/ on first run.
-The embedded python-standalone interpreter runs the agent as a subprocess.
+supervisor/, prompts/, web/, docs/, assets/) is included as data and copied to
+~/Ouroboros/repo/ on first run. The embedded python-standalone interpreter runs
+the agent as a subprocess.
 """
 
 import os
@@ -78,8 +79,9 @@ a = Analysis(
         ('supervisor', 'supervisor'),
         ('prompts', 'prompts'),
         ('web', 'web'),
+        ('docs', 'docs'),
         ('tests', 'tests'),
-        ('assets/logo.jpg', 'assets'),
+        ('assets', 'assets'),
         ('python-standalone', 'python-standalone'),
     ] + _extra_datas,
     hiddenimports=[

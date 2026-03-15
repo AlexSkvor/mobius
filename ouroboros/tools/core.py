@@ -75,25 +75,65 @@ def _data_write(ctx: ToolContext, path: str, content: str, mode: str = "overwrit
 # Send photo to owner
 # ---------------------------------------------------------------------------
 
-def _send_photo(ctx: ToolContext, image_base64: str, caption: str = "") -> str:
-    """Send a base64-encoded image to the owner's chat."""
+_MAX_PHOTO_FILE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+def _detect_image_mime(data: bytes) -> str:
+    """Detect image MIME type from magic bytes."""
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        return "image/png"
+    if data[:2] == b'\xff\xd8':
+        return "image/jpeg"
+    if data[:4] == b'GIF8':
+        return "image/gif"
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return "image/webp"
+    return "application/octet-stream"
+
+
+def _send_photo(ctx: ToolContext, file_path: str = "", image_base64: str = "",
+                caption: str = "") -> str:
+    """Send an image to the owner's chat.
+
+    Preferred: file_path — reads a local image file.
+    Legacy:    image_base64 — accepts raw base64 string or __last_screenshot__.
+    """
     if not ctx.current_chat_id:
         return "⚠️ No active chat — cannot send photo."
 
-    # Resolve screenshot reference from stash
-    actual_b64 = image_base64
-    if image_base64 == "__last_screenshot__":
-        if not ctx.browser_state.last_screenshot_b64:
-            return "⚠️ No screenshot stored. Take one first with browse_page(output='screenshot')."
-        actual_b64 = ctx.browser_state.last_screenshot_b64
+    actual_b64 = ""
+    mime = "image/png"
+
+    if file_path:
+        fp = pathlib.Path(file_path).expanduser().resolve()
+        if not fp.exists():
+            return f"⚠️ File not found: {file_path}"
+        if fp.stat().st_size > _MAX_PHOTO_FILE_BYTES:
+            return f"⚠️ File too large ({fp.stat().st_size} bytes). Max: {_MAX_PHOTO_FILE_BYTES} bytes."
+        try:
+            raw = fp.read_bytes()
+            mime = _detect_image_mime(raw)
+            actual_b64 = __import__("base64").b64encode(raw).decode()
+        except Exception as e:
+            return f"⚠️ Failed to read image file: {e}"
+    elif image_base64:
+        if image_base64 == "__last_screenshot__":
+            if not ctx.browser_state.last_screenshot_b64:
+                return "⚠️ No screenshot stored. Take one first with browse_page(output='screenshot')."
+            actual_b64 = ctx.browser_state.last_screenshot_b64
+        else:
+            actual_b64 = image_base64
+    else:
+        return "⚠️ Provide either file_path or image_base64."
 
     if not actual_b64 or len(actual_b64) < 100:
-        return "⚠️ image_base64 is empty or too short. Take a screenshot first with browse_page(output='screenshot')."
+        return "⚠️ Image data is empty or too short."
 
     ctx.pending_events.append({
         "type": "send_photo",
         "chat_id": ctx.current_chat_id,
         "image_base64": actual_b64,
+        "mime": mime,
         "caption": caption or "",
     })
     return "OK: photo queued for delivery to owner."
@@ -209,7 +249,7 @@ def _codebase_digest(ctx: ToolContext) -> str:
 # ---------------------------------------------------------------------------
 
 def _summarize_dialogue(ctx: ToolContext, last_n: int = 200) -> str:
-    """Summarize dialogue history into key moments, decisions, and creator preferences."""
+    """Summarize dialogue history into key moments, decisions, and user preferences."""
     from ouroboros.llm import LLMClient, DEFAULT_LIGHT_MODEL
 
     # Read last_n messages from chat.jsonl
@@ -247,11 +287,11 @@ def _summarize_dialogue(ctx: ToolContext, last_n: int = 200) -> str:
         formatted_dialogue = "\n".join(dialogue_text)
 
         # Build summarization prompt
-        prompt = f"""Summarize the following dialogue history between the creator and Ouroboros.
+        prompt = f"""Summarize the following dialogue history between the user and Ouroboros.
 
 Extract:
 1. Key decisions made (technical, architectural, strategic)
-2. Creator's preferences and communication style
+2. User preferences and communication style
 3. Important technical choices and their rationale
 4. Recurring themes or patterns
 
@@ -385,14 +425,16 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("send_photo", {
             "name": "send_photo",
             "description": (
-                "Send a base64-encoded image (PNG) to the owner's chat. "
-                "Use after browse_page(output='screenshot') or browser_action(action='screenshot'). "
-                "Pass the base64 string from the screenshot result as image_base64."
+                "Send an image to the owner's chat. "
+                "Preferred: use file_path to send a local file. "
+                "Legacy: use image_base64 with raw base64 or __last_screenshot__. "
+                "Use after browse_page(output='screenshot') or browser_action(action='screenshot')."
             ),
             "parameters": {"type": "object", "properties": {
-                "image_base64": {"type": "string", "description": "Base64-encoded PNG image data"},
+                "file_path": {"type": "string", "description": "Local file path to image (preferred)"},
+                "image_base64": {"type": "string", "description": "Base64-encoded image data or __last_screenshot__"},
                 "caption": {"type": "string", "description": "Optional caption for the photo"},
-            }, "required": ["image_base64"]},
+            }, "required": []},
         }, _send_photo),
         ToolEntry("codebase_digest", {
             "name": "codebase_digest",
@@ -401,7 +443,7 @@ def get_tools() -> List[ToolEntry]:
         }, _codebase_digest),
         ToolEntry("summarize_dialogue", {
             "name": "summarize_dialogue",
-            "description": "Summarize dialogue history into key moments, decisions, and creator preferences. Writes to memory/dialogue_summary.md.",
+            "description": "Summarize dialogue history into key moments, decisions, and user preferences. Writes to memory/dialogue_summary.md.",
             "parameters": {"type": "object", "properties": {
                 "last_n": {"type": "integer", "description": "Number of recent messages to summarize (default 200)"},
             }, "required": []},

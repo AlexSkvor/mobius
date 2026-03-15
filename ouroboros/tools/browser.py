@@ -4,8 +4,9 @@ Browser automation tools via Playwright (sync API).
 Provides browse_page (open URL, get content/screenshot)
 and browser_action (click, fill, evaluate JS on current page).
 
-Browser state lives in ToolContext (per-task lifecycle),
-not module-level globals — safe across threads.
+Each BrowserState (in ToolContext) fully owns its Playwright lifecycle:
+no module-level singletons, no cross-context sharing. Thread affinity
+is tracked per-BrowserState via _thread_id.
 """
 
 from __future__ import annotations
@@ -28,10 +29,6 @@ from ouroboros.tools.registry import ToolContext, ToolEntry
 log = logging.getLogger(__name__)
 
 _playwright_ready = False
-# Module-level Playwright instance to avoid greenlet threading issues
-# Persists across ToolContext recreations but can be reset on error
-_pw_instance = None
-_pw_thread_id = None  # Track which thread owns the Playwright instance
 
 
 def _ensure_playwright_installed():
@@ -46,7 +43,7 @@ def _ensure_playwright_installed():
         if getattr(sys, 'frozen', False):
             raise RuntimeError(
                 "Browser tools require Playwright, which is not bundled. "
-                "Install manually: pip install playwright && python -m playwright install chromium"
+                "Install manually: pip3 install playwright && python3 -m playwright install chromium"
             )
         log.info("Playwright not found, installing...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright"])
@@ -60,7 +57,7 @@ def _ensure_playwright_installed():
         if getattr(sys, 'frozen', False):
             raise RuntimeError(
                 "Playwright chromium binary not found. "
-                "Install manually: python -m playwright install chromium"
+                "Install manually: python3 -m playwright install chromium"
             )
         log.info("Installing Playwright chromium binary...")
         subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
@@ -69,92 +66,34 @@ def _ensure_playwright_installed():
     _playwright_ready = True
 
 
-def _reset_playwright_greenlet():
-    """
-    Fully reset Playwright's greenlet state by purging all related modules.
-    This is necessary because sync_playwright() uses greenlets internally,
-    and once a greenlet dies, it cannot be reused across "threads".
-    """
-    global _pw_instance, _pw_thread_id
-
-    log.info("Resetting Playwright greenlet state...")
-
-    # Kill any lingering chromium processes
-    try:
-        if sys.platform == "win32":
-            subprocess.run(["taskkill", "/F", "/IM", "chromium.exe"], capture_output=True, timeout=5)
-        else:
-            subprocess.run(["pkill", "-9", "-f", "chromium"], capture_output=True, timeout=5)
-    except Exception:
-        log.debug("Failed to kill chromium processes during reset", exc_info=True)
-
-    # Purge all playwright modules from sys.modules to reset greenlet state
-    mods_to_remove = [k for k in sys.modules.keys() if k.startswith('playwright')]
-    for k in mods_to_remove:
-        del sys.modules[k]
-
-    # Also purge greenlet-related modules to ensure clean state
-    mods_to_remove = [k for k in sys.modules.keys() if 'greenlet' in k.lower()]
-    for k in mods_to_remove:
-        try:
-            del sys.modules[k]
-        except Exception:
-            log.debug(f"Failed to delete greenlet module {k} during reset", exc_info=True)
-            pass
-
-    # Reset module-level instance and thread ID
-    _pw_instance = None
-    _pw_thread_id = None
-    log.info("Playwright greenlet state reset complete")
-
-
 def _ensure_browser(ctx: ToolContext):
-    """Create or reuse browser for this task. Browser state lives in ctx,
-    but Playwright instance is module-level to avoid greenlet issues."""
-    global _pw_instance, _pw_thread_id
-
-    # Check if we've switched threads - if so, reset everything
+    """Create or reuse browser for this context. All Playwright state lives
+    in ctx.browser_state — no module-level globals."""
+    bs = ctx.browser_state
     current_thread_id = threading.get_ident()
-    if _pw_instance is not None and _pw_thread_id != current_thread_id:
-        log.info(f"Thread switch detected (old={_pw_thread_id}, new={current_thread_id}). Resetting Playwright...")
-        _reset_playwright_greenlet()
 
-    if ctx.browser_state.browser is not None:
+    if bs._thread_id is not None and bs._thread_id != current_thread_id:
+        log.info("Thread switch detected (old=%s, new=%s). Tearing down browser for this context.",
+                 bs._thread_id, current_thread_id)
+        cleanup_browser(ctx)
+
+    if bs.browser is not None:
         try:
-            if ctx.browser_state.browser.is_connected():
-                return ctx.browser_state.page
+            if bs.browser.is_connected():
+                return bs.page
         except Exception:
-            log.debug("Browser connection check failed in _ensure_browser", exc_info=True)
-            pass
-        # Browser died — clean up and recreate
+            log.debug("Browser connection check failed", exc_info=True)
         cleanup_browser(ctx)
 
     _ensure_playwright_installed()
 
-    # Use module-level Playwright instance to avoid greenlet threading issues
-    if _pw_instance is None:
+    if bs.pw_instance is None:
         from playwright.sync_api import sync_playwright
+        bs.pw_instance = sync_playwright().start()
+        bs._thread_id = current_thread_id
+        log.info("Created Playwright instance in thread %s", current_thread_id)
 
-        try:
-            _pw_instance = sync_playwright().start()
-            _pw_thread_id = current_thread_id  # Record which thread owns this instance
-            log.info(f"Created Playwright instance in thread {_pw_thread_id}")
-        except RuntimeError as e:
-            if "cannot switch" in str(e) or "different thread" in str(e):
-                # Greenlet is dead, do a full reset
-                _reset_playwright_greenlet()
-                # Now import fresh and try again
-                from playwright.sync_api import sync_playwright
-                _pw_instance = sync_playwright().start()
-                _pw_thread_id = current_thread_id
-                log.info(f"Recreated Playwright instance in thread {_pw_thread_id} after error")
-            else:
-                raise
-
-    # Store reference in ctx for cleanup
-    ctx.browser_state.pw_instance = _pw_instance
-
-    ctx.browser_state.browser = _pw_instance.chromium.launch(
+    bs.browser = bs.pw_instance.chromium.launch(
         headless=True,
         args=[
             "--no-sandbox",
@@ -164,7 +103,7 @@ def _ensure_browser(ctx: ToolContext):
             "--window-size=1920,1080",
         ],
     )
-    ctx.browser_state.page = ctx.browser_state.browser.new_page(
+    bs.page = bs.browser.new_page(
         viewport={"width": 1920, "height": 1080},
         user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -174,39 +113,68 @@ def _ensure_browser(ctx: ToolContext):
 
     if _HAS_STEALTH:
         stealth = Stealth()
-        stealth.apply_stealth_sync(ctx.browser_state.page)
+        stealth.apply_stealth_sync(bs.page)
 
-    ctx.browser_state.page.set_default_timeout(30000)
-    return ctx.browser_state.page
+    bs.page.set_default_timeout(30000)
+    return bs.page
 
 
 def cleanup_browser(ctx: ToolContext) -> None:
-    """Close browser and playwright. Called by agent.py in finally block.
-
-    Note: We DON'T stop the module-level _pw_instance here to allow reuse
-    across tasks. Only close the browser and page for this context.
-    """
-    global _pw_instance
-
+    """Full teardown: close page, browser, AND stop the Playwright instance.
+    Called by agent.py in finally block and by recovery logic on errors."""
+    bs = ctx.browser_state
     try:
-        if ctx.browser_state.page is not None:
-            ctx.browser_state.page.close()
+        if bs.page is not None:
+            bs.page.close()
     except Exception:
         log.debug("Failed to close browser page during cleanup", exc_info=True)
-        pass
     try:
-        if ctx.browser_state.browser is not None:
-            ctx.browser_state.browser.close()
-    except Exception as e:
-        # If browser cleanup fails with thread error, reset everything
-        if "cannot switch" in str(e) or "different thread" in str(e):
-            log.warning("Browser cleanup hit thread error, resetting Playwright...")
-            _reset_playwright_greenlet()
+        if bs.browser is not None:
+            bs.browser.close()
+    except Exception:
+        log.debug("Failed to close browser during cleanup", exc_info=True)
+    try:
+        if bs.pw_instance is not None:
+            bs.pw_instance.stop()
+    except Exception:
+        log.debug("Failed to stop Playwright instance during cleanup", exc_info=True)
+    bs.page = None
+    bs.browser = None
+    bs.pw_instance = None
+    bs._thread_id = None
 
-    # Clear ctx references but keep module-level _pw_instance alive for reuse
-    ctx.browser_state.page = None
-    ctx.browser_state.browser = None
-    ctx.browser_state.pw_instance = None
+
+def _is_infrastructure_error(obj: Any) -> bool:
+    """Detect browser infrastructure failure from either context state or an error object.
+
+    Backward-compat: older tests call this with an exception and expect string-based
+    detection of greenlet/thread/browser teardown failures.
+    """
+    if hasattr(obj, "browser_state"):
+        bs = obj.browser_state
+        if bs.browser is None or bs.pw_instance is None:
+            return True
+        try:
+            if not bs.browser.is_connected():
+                return True
+        except Exception:
+            return True
+        if bs.page is not None:
+            try:
+                if bs.page.is_closed():
+                    return True
+            except Exception:
+                return True
+        return False
+
+    msg = str(obj).lower()
+    return any(token in msg for token in (
+        "green thread",
+        "different thread",
+        "browser has been closed",
+        "page has been closed",
+        "connection closed",
+    ))
 
 
 _MARKDOWN_JS = """() => {
@@ -234,16 +202,16 @@ _MARKDOWN_JS = """() => {
 }"""
 
 
-def _extract_page_output(page: Any, output: str, ctx: ToolContext):
+def _extract_page_output(page: Any, output: str, ctx: ToolContext) -> str:
     """Extract page content in the requested format."""
     if output == "screenshot":
         data = page.screenshot(type="png", full_page=False)
         b64 = base64.b64encode(data).decode()
         ctx.browser_state.last_screenshot_b64 = b64
-        return {
-            "__image__": {"base64": b64, "mime": "image/png"},
-            "text": f"Screenshot captured ({len(b64)} bytes base64). Use analyze_screenshot to analyze it, or send_photo to deliver to owner."
-        }
+        return (
+            f"Screenshot captured ({len(b64)} bytes base64). "
+            f"Call send_photo(image_base64='__last_screenshot__') to deliver it to the user."
+        )
     elif output == "html":
         html = page.content()
         return html[:50000] + ("... [truncated]" if len(html) > 50000 else "")
@@ -257,29 +225,37 @@ def _extract_page_output(page: Any, output: str, ctx: ToolContext):
 
 def _browse_page(ctx: ToolContext, url: str, output: str = "text",
                  wait_for: str = "", timeout: int = 30000,
-                 viewport_width: int = 0, viewport_height: int = 0) -> str:
+                 viewport: str = "") -> str:
     try:
         page = _ensure_browser(ctx)
-        if viewport_width > 0 or viewport_height > 0:
-            page.set_viewport_size({
-                "width": viewport_width or 1920,
-                "height": viewport_height or 1080,
-            })
+        if viewport:
+            _apply_viewport(page, viewport)
         page.goto(url, timeout=timeout, wait_until="domcontentloaded")
         if wait_for:
             page.wait_for_selector(wait_for, timeout=timeout)
         return _extract_page_output(page, output, ctx)
     except Exception as e:
-        if "cannot switch" in str(e) or "different thread" in str(e) or "greenlet" in str(e).lower():
-            log.warning(f"Browser thread error detected: {e}. Resetting Playwright and retrying...")
+        if _is_infrastructure_error(ctx):
+            log.warning("Browser infrastructure error: %s. Cleaning up and retrying...", e)
             cleanup_browser(ctx)
-            _reset_playwright_greenlet()
             page = _ensure_browser(ctx)
+            if viewport:
+                _apply_viewport(page, viewport)
             page.goto(url, timeout=timeout, wait_until="domcontentloaded")
             if wait_for:
                 page.wait_for_selector(wait_for, timeout=timeout)
             return _extract_page_output(page, output, ctx)
         raise
+
+
+def _apply_viewport(page: Any, viewport: str) -> None:
+    """Parse a 'WxH' string and resize the browser viewport."""
+    try:
+        parts = viewport.lower().split("x")
+        w, h = int(parts[0]), int(parts[1])
+        page.set_viewport_size({"width": max(320, w), "height": max(480, h)})
+    except (ValueError, IndexError):
+        log.warning("Invalid viewport '%s', expected WxH (e.g. '375x812')", viewport)
 
 
 def _browser_action(ctx: ToolContext, action: str, selector: str = "",
@@ -307,10 +283,10 @@ def _browser_action(ctx: ToolContext, action: str, selector: str = "",
             data = page.screenshot(type="png", full_page=False)
             b64 = base64.b64encode(data).decode()
             ctx.browser_state.last_screenshot_b64 = b64
-            return {
-                "__image__": {"base64": b64, "mime": "image/png"},
-                "text": f"Screenshot captured ({len(b64)} bytes base64). Use analyze_screenshot to analyze it, or send_photo to deliver to owner."
-            }
+            return (
+                f"Screenshot captured ({len(b64)} bytes base64). "
+                f"Call send_photo(image_base64='__last_screenshot__') to deliver it to the user."
+            )
         elif action == "evaluate":
             if not value:
                 return "Error: value (JS code) required for evaluate"
@@ -333,16 +309,12 @@ def _browser_action(ctx: ToolContext, action: str, selector: str = "",
 
     try:
         return _do_action()
-    except (RuntimeError, Exception) as e:
-        # Catch greenlet threading errors and reset Playwright completely
-        if "cannot switch" in str(e) or "different thread" in str(e) or "greenlet" in str(e).lower():
-            log.warning(f"Browser thread error detected: {e}. Resetting Playwright and retrying...")
+    except Exception as e:
+        if _is_infrastructure_error(ctx):
+            log.warning("Browser infrastructure error: %s. Cleaning up and retrying...", e)
             cleanup_browser(ctx)
-            _reset_playwright_greenlet()
-            # Retry once with fresh state
             return _do_action()
-        else:
-            raise
+        raise
 
 
 def get_tools() -> List[ToolEntry]:
@@ -355,7 +327,8 @@ def get_tools() -> List[ToolEntry]:
                     "Open a URL in headless browser. Returns page content as text, "
                     "html, markdown, or screenshot (base64 PNG). "
                     "Browser persists across calls within a task. "
-                    "For screenshots: use send_photo tool to deliver the image to owner."
+                    "For screenshots: use send_photo tool to deliver the image to the user. "
+                    "Use viewport to test mobile layouts (e.g. '375x812')."
                 ),
                 "parameters": {
                     "type": "object",
@@ -374,13 +347,9 @@ def get_tools() -> List[ToolEntry]:
                             "type": "integer",
                             "description": "Page load timeout in ms (default: 30000)",
                         },
-                        "viewport_width": {
-                            "type": "integer",
-                            "description": "Viewport width in pixels (default: 1920)",
-                        },
-                        "viewport_height": {
-                            "type": "integer",
-                            "description": "Viewport height in pixels (default: 1080)",
+                        "viewport": {
+                            "type": "string",
+                            "description": "Viewport size as WxH (e.g. '375x812' for mobile, '1920x1080' for desktop). Default: current viewport.",
                         },
                     },
                     "required": ["url"],

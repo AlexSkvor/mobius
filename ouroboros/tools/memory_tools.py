@@ -40,7 +40,7 @@ def _memory_update_registry(
     """Update or create an entry in the memory registry.
 
     Args:
-        source_id: Identifier for the data source (e.g. 'user-notes')
+        source_id: Identifier for the data source (e.g. 'user-context')
         updates: Full content for this entry (markdown lines with - **Key:** value)
     """
     if not source_id or not isinstance(source_id, str):
@@ -121,7 +121,7 @@ def get_tools() -> List[ToolEntry]:
                 "properties": {
                     "source_id": {
                         "type": "string",
-                        "description": "Source identifier (e.g. 'user-notes', 'project-docs')"
+                        "description": "Source identifier (e.g. 'user-context', 'project-notes')"
                     },
                     "updates": {
                         "type": "string",

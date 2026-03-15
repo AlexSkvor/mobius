@@ -53,20 +53,28 @@ export function initChat({ ws, state, updateUnreadBadge }) {
         } catch { return null; }
     }
 
-    function addMessage(text, role, markdown = false, timestamp = null, isProgress = false) {
+    const pendingUserBubbles = new Map();
+
+    function addMessage(text, role, markdown = false, timestamp = null, isProgress = false, opts = {}) {
+        const pending = !!opts.pending;
+        const clientMessageId = opts.clientMessageId || '';
         const ts = timestamp || new Date().toISOString();
         if (!isProgress) _chatHistory.push({ text, role, ts });
         const bubble = document.createElement('div');
         bubble.className = `chat-bubble ${role}` + (isProgress ? ' progress' : '');
+        if (pending) bubble.classList.add('pending');
+        if (clientMessageId) bubble.dataset.clientMessageId = clientMessageId;
         const sender = role === 'user' ? 'You' : (isProgress ? '\uD83D\uDCAC Ouroboros' : 'Ouroboros');
         const rendered = role === 'assistant' ? renderMarkdown(text) : escapeHtml(text);
         const timeFmt = formatMsgTime(ts);
         const timeHtml = timeFmt
             ? `<div class="msg-time" title="${timeFmt.full}">${timeFmt.short}</div>`
             : '';
+        const pendingHtml = pending ? `<div class="msg-pending">Queued until reconnect</div>` : '';
         bubble.innerHTML = `
             <div class="sender">${sender}</div>
             <div class="message">${rendered}</div>
+            ${pendingHtml}
             ${timeHtml}
         `;
         const typing = document.getElementById('typing-indicator');
@@ -77,6 +85,8 @@ export function initChat({ ws, state, updateUnreadBadge }) {
         }
         messagesDiv.scrollTop = messagesDiv.scrollHeight;
         try { sessionStorage.setItem('ouro_chat', JSON.stringify(_chatHistory.slice(-200))); } catch {}
+        if (pending && clientMessageId) pendingUserBubbles.set(clientMessageId, bubble);
+        return bubble;
     }
 
     // Restore chat history from server (persists across app restarts)
@@ -103,8 +113,11 @@ export function initChat({ ws, state, updateUnreadBadge }) {
         if (!text) return;
         input.value = '';
         input.style.height = 'auto';
-        addMessage(text, 'user');
-        ws.send({ type: 'chat', content: text });
+        const result = ws.send({ type: 'chat', content: text });
+        addMessage(text, 'user', false, null, false, {
+            pending: result?.status === 'queued',
+            clientMessageId: result?.clientMessageId || '',
+        });
     }
 
     sendBtn.addEventListener('click', sendMessage);
@@ -158,6 +171,14 @@ export function initChat({ ws, state, updateUnreadBadge }) {
         }
     });
 
+    ws.on('outbound_sent', (evt) => {
+        const bubble = pendingUserBubbles.get(evt?.clientMessageId || '');
+        if (!bubble) return;
+        bubble.classList.remove('pending');
+        bubble.querySelector('.msg-pending')?.remove();
+        pendingUserBubbles.delete(evt.clientMessageId);
+    });
+
     ws.on('photo', (msg) => {
         hideTyping();
         const bubble = document.createElement('div');
@@ -170,7 +191,7 @@ export function initChat({ ws, state, updateUnreadBadge }) {
         bubble.innerHTML = `
             <div class="sender">Ouroboros</div>
             ${captionHtml}
-            <div class="message"><img src="data:image/png;base64,${msg.image_base64}" style="max-width:100%;border-radius:8px;cursor:pointer" onclick="window.open(this.src,'_blank')" /></div>
+            <div class="message"><img src="data:${msg.mime || 'image/png'};base64,${msg.image_base64}" style="max-width:100%;border-radius:8px;cursor:pointer" onclick="window.open(this.src,'_blank')" /></div>
             ${timeHtml}
         `;
         const typing = document.getElementById('typing-indicator');

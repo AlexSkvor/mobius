@@ -82,6 +82,8 @@ def _handle_llm_usage(evt: Dict[str, Any], ctx: Any) -> None:
             "cost": resolved_cost,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
+            "cached_tokens": cached_tokens,
+            "cache_write_tokens": cache_write_tokens,
         })
     except Exception:
         log.warning("Failed to log llm_usage event to events.jsonl", exc_info=True)
@@ -97,6 +99,20 @@ def _handle_task_heartbeat(evt: Dict[str, Any], ctx: Any) -> None:
         if phase:
             meta["heartbeat_phase"] = phase
         ctx.RUNNING[task_id] = meta
+        task = meta.get("task") if isinstance(meta.get("task"), dict) else {}
+        started_at = float(meta.get("started_at") or 0.0)
+        runtime_sec = round(max(0.0, time.time() - started_at), 1) if started_at > 0 else None
+        try:
+            ctx.bridge.push_log({
+                "ts": evt.get("ts", datetime.datetime.now(datetime.timezone.utc).isoformat()),
+                "type": "task_heartbeat",
+                "task_id": task_id,
+                "task_type": task.get("type"),
+                "phase": phase or meta.get("heartbeat_phase") or "running",
+                "runtime_sec": runtime_sec,
+            })
+        except Exception:
+            log.debug("Failed to forward task heartbeat to live logs", exc_info=True)
 
 
 def _handle_typing_start(evt: Dict[str, Any], ctx: Any) -> None:
@@ -120,6 +136,7 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             log_text=(str(log_text) if isinstance(log_text, str) else None),
             fmt=fmt,
             is_progress=is_progress,
+            task_id=str(evt.get("task_id") or ""),
         )
     except Exception as e:
         ctx.append_jsonl(
@@ -173,6 +190,19 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
     if wid in ctx.WORKERS and ctx.WORKERS[wid].busy_task_id == task_id:
         ctx.WORKERS[wid].busy_task_id = None
     ctx.persist_queue_snapshot(reason="task_done")
+    try:
+        ctx.bridge.push_log({
+            "ts": evt.get("ts", datetime.datetime.now(datetime.timezone.utc).isoformat()),
+            "type": "task_done",
+            "task_id": task_id,
+            "task_type": task_type,
+            "cost_usd": evt.get("cost_usd"),
+            "total_rounds": evt.get("total_rounds"),
+            "prompt_tokens": evt.get("prompt_tokens"),
+            "completion_tokens": evt.get("completion_tokens"),
+        })
+    except Exception:
+        log.debug("Failed to forward task_done to live logs", exc_info=True)
 
     # Store task result for subtask retrieval
     try:
@@ -377,11 +407,14 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
 
 def _handle_toggle_consciousness(evt: Dict[str, Any], ctx: Any) -> None:
     """Toggle background consciousness from LLM tool call."""
+    from supervisor.state import update_state
     action = str(evt.get("action") or "status")
     if action in ("start", "on"):
         result = ctx.consciousness.start()
+        update_state(lambda st: st.__setitem__("bg_consciousness_enabled", True))
     elif action in ("stop", "off"):
         result = ctx.consciousness.stop()
+        update_state(lambda st: st.__setitem__("bg_consciousness_enabled", False))
     else:
         status = "running" if ctx.consciousness.is_running else "stopped"
         result = f"Background consciousness: {status}"
@@ -391,16 +424,17 @@ def _handle_toggle_consciousness(evt: Dict[str, Any], ctx: Any) -> None:
 
 
 def _handle_send_photo(evt: Dict[str, Any], ctx: Any) -> None:
-    """Send a photo (base64 PNG) to the owner's chat."""
+    """Send a photo to the owner's chat."""
     import base64 as b64mod
     try:
         chat_id = int(evt.get("chat_id") or 0)
         image_b64 = str(evt.get("image_base64") or "")
         caption = str(evt.get("caption") or "")
+        mime = str(evt.get("mime") or "image/png")
         if not chat_id or not image_b64:
             return
         photo_bytes = b64mod.b64decode(image_b64)
-        ok, err = ctx.bridge.send_photo(chat_id, photo_bytes, caption=caption)
+        ok, err = ctx.bridge.send_photo(chat_id, photo_bytes, caption=caption, mime=mime)
         if not ok:
             ctx.append_jsonl(
                 ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
@@ -434,6 +468,21 @@ def _handle_owner_message_injected(evt: Dict[str, Any], ctx: Any) -> None:
         log.warning("Failed to log owner_message_injected event", exc_info=True)
 
 
+def _handle_log_event(evt: Dict[str, Any], ctx: Any) -> None:
+    """Forward worker-emitted live-only timeline events to the UI."""
+    data = evt.get("data")
+    if not isinstance(data, dict):
+        return
+    payload = {
+        "ts": data.get("ts", datetime.datetime.now(datetime.timezone.utc).isoformat()),
+        **data,
+    }
+    try:
+        ctx.bridge.push_log(payload)
+    except Exception:
+        log.debug("Failed to forward live log event", exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
@@ -452,6 +501,7 @@ EVENT_HANDLERS = {
     "toggle_evolution": _handle_toggle_evolution,
     "toggle_consciousness": _handle_toggle_consciousness,
     "owner_message_injected": _handle_owner_message_injected,
+    "log_event": _handle_log_event,
 }
 
 

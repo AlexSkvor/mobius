@@ -293,7 +293,7 @@ def get_tools() -> List[ToolEntry]:
                 "properties": {
                     "topic": {
                         "type": "string",
-                        "description": "Topic name (alphanumeric, hyphens, underscores). E.g. 'browser-automation', 'joi_gotchas'"
+                        "description": "Topic name (alphanumeric, hyphens, underscores). E.g. 'browser-automation', 'git-recipes'"
                     }
                 },
                 "required": ["topic"]

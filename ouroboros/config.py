@@ -56,6 +56,16 @@ SETTINGS_DEFAULTS = {
     "OUROBOROS_BG_WAKEUP_MAX": 7200,
     "OUROBOROS_EVO_COST_THRESHOLD": 0.10,
     "OUROBOROS_WEBSEARCH_MODEL": "gpt-5.2",
+    # Pre-commit review: comma-separated list of OpenRouter model IDs
+    "OUROBOROS_REVIEW_MODELS": "openai/gpt-5.4,google/gemini-3.1-pro-preview,anthropic/claude-opus-4.6",
+    # Pre-commit review enforcement: advisory | blocking
+    "OUROBOROS_REVIEW_ENFORCEMENT": "blocking",
+    # Reasoning effort per task type: none | low | medium | high
+    # OUROBOROS_INITIAL_REASONING_EFFORT remains a legacy alias for task/chat.
+    "OUROBOROS_EFFORT_TASK": "none",
+    "OUROBOROS_EFFORT_EVOLUTION": "high",
+    "OUROBOROS_EFFORT_REVIEW": "medium",
+    "OUROBOROS_EFFORT_CONSCIOUSNESS": "low",
     "GITHUB_TOKEN": "",
     "GITHUB_REPO": "",
     # Local model (llama-cpp-python server)
@@ -64,12 +74,50 @@ SETTINGS_DEFAULTS = {
     "LOCAL_MODEL_PORT": 8766,
     "LOCAL_MODEL_N_GPU_LAYERS": 0,
     "LOCAL_MODEL_CONTEXT_LENGTH": 16384,
-    "LOCAL_MODEL_CHAT_FORMAT": "",
+    "LOCAL_MODEL_CHAT_FORMAT": "chatml-function-calling",
     "USE_LOCAL_MAIN": False,
     "USE_LOCAL_CODE": False,
     "USE_LOCAL_LIGHT": False,
     "USE_LOCAL_FALLBACK": False,
 }
+
+_VALID_EFFORTS = ("none", "low", "medium", "high")
+
+
+def resolve_effort(task_type: str) -> str:
+    """Return the configured reasoning effort for the given task type."""
+    t = (task_type or "").lower().strip()
+
+    if t == "evolution":
+        key = "OUROBOROS_EFFORT_EVOLUTION"
+        default = "high"
+    elif t == "review":
+        key = "OUROBOROS_EFFORT_REVIEW"
+        default = "medium"
+    elif t == "consciousness":
+        key = "OUROBOROS_EFFORT_CONSCIOUSNESS"
+        default = "low"
+    else:
+        legacy = os.environ.get("OUROBOROS_INITIAL_REASONING_EFFORT", "")
+        key = "OUROBOROS_EFFORT_TASK"
+        default = legacy if legacy in _VALID_EFFORTS else "none"
+
+    raw = os.environ.get(key, default)
+    return raw if raw in _VALID_EFFORTS else default
+
+
+def get_review_models() -> list[str]:
+    """Return the configured pre-commit review model list."""
+    default_str = SETTINGS_DEFAULTS["OUROBOROS_REVIEW_MODELS"]
+    models_str = os.environ.get("OUROBOROS_REVIEW_MODELS", default_str) or default_str
+    return [m.strip() for m in models_str.split(",") if m.strip()]
+
+
+def get_review_enforcement() -> str:
+    """Return the configured pre-commit review enforcement mode."""
+    default_val = str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_ENFORCEMENT"])
+    raw = (os.environ.get("OUROBOROS_REVIEW_ENFORCEMENT", default_val) or default_val).strip().lower()
+    return raw if raw in {"advisory", "blocking"} else default_val
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +211,9 @@ def apply_settings_to_env(settings: dict) -> None:
         "OUROBOROS_TOOL_TIMEOUT_SEC",
         "OUROBOROS_BG_MAX_ROUNDS", "OUROBOROS_BG_WAKEUP_MIN", "OUROBOROS_BG_WAKEUP_MAX",
         "OUROBOROS_EVO_COST_THRESHOLD", "OUROBOROS_WEBSEARCH_MODEL",
+        "OUROBOROS_REVIEW_MODELS", "OUROBOROS_REVIEW_ENFORCEMENT",
+        "OUROBOROS_EFFORT_TASK", "OUROBOROS_EFFORT_EVOLUTION",
+        "OUROBOROS_EFFORT_REVIEW", "OUROBOROS_EFFORT_CONSCIOUSNESS",
         "LOCAL_MODEL_SOURCE", "LOCAL_MODEL_FILENAME",
         "LOCAL_MODEL_PORT", "LOCAL_MODEL_N_GPU_LAYERS", "LOCAL_MODEL_CONTEXT_LENGTH",
         "LOCAL_MODEL_CHAT_FORMAT",
@@ -174,6 +225,10 @@ def apply_settings_to_env(settings: dict) -> None:
             os.environ.pop(k, None)
         else:
             os.environ[k] = str(val)
+    if not os.environ.get("OUROBOROS_REVIEW_MODELS"):
+        os.environ["OUROBOROS_REVIEW_MODELS"] = str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_MODELS"])
+    if not os.environ.get("OUROBOROS_REVIEW_ENFORCEMENT"):
+        os.environ["OUROBOROS_REVIEW_ENFORCEMENT"] = str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_ENFORCEMENT"])
 
 
 # ---------------------------------------------------------------------------

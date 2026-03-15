@@ -27,7 +27,7 @@ export function initSettings({ ws, state }) {
                     <div class="form-field"><label>Port</label><input id="s-local-port" type="number" value="8766" style="width:100px"></div>
                     <div class="form-field"><label>GPU Layers (-1 = all)</label><input id="s-local-gpu-layers" type="number" value="-1" style="width:100px"></div>
                     <div class="form-field"><label>Context Length</label><input id="s-local-ctx" type="number" value="16384" style="width:120px" placeholder="16384"></div>
-                    <div class="form-field"><label>Chat Format</label><input id="s-local-chat-format" value="" placeholder="auto-detect" style="width:200px"></div>
+                    <div class="form-field"><label>Chat Format</label><input id="s-local-chat-format" value="chatml-function-calling" style="width:200px"></div>
                 </div>
                 <div class="form-row" style="align-items:center;gap:8px">
                     <button class="btn btn-primary" id="btn-local-start">Start</button>
@@ -46,22 +46,86 @@ export function initSettings({ ws, state }) {
                 </div>
                 <div class="form-row" style="align-items:flex-end">
                     <div class="form-field"><label>Main Model</label><input id="s-model" value="anthropic/claude-sonnet-4.6" style="width:250px"></div>
-                    <label class="local-toggle"><input type="checkbox" id="s-local-main"> Local</label>
+                    <label class="local-toggle"><input type="checkbox" id="s-local-main" disabled> Local</label>
                 </div>
                 <div class="form-row" style="align-items:flex-end">
                     <div class="form-field"><label>Code Model</label><input id="s-model-code" value="anthropic/claude-sonnet-4.6" style="width:250px"></div>
-                    <label class="local-toggle"><input type="checkbox" id="s-local-code"> Local</label>
+                    <label class="local-toggle"><input type="checkbox" id="s-local-code" disabled> Local</label>
                 </div>
                 <div class="form-row" style="align-items:flex-end">
                     <div class="form-field"><label>Light Model</label><input id="s-model-light" value="google/gemini-3-flash-preview" style="width:250px"></div>
-                    <label class="local-toggle"><input type="checkbox" id="s-local-light"> Local</label>
+                    <label class="local-toggle"><input type="checkbox" id="s-local-light" disabled> Local</label>
                 </div>
                 <div class="form-row" style="align-items:flex-end">
                     <div class="form-field"><label>Fallback Model</label><input id="s-model-fallback" value="google/gemini-3-flash-preview" style="width:250px"></div>
-                    <label class="local-toggle"><input type="checkbox" id="s-local-fallback"> Local</label>
+                    <label class="local-toggle"><input type="checkbox" id="s-local-fallback" disabled> Local</label>
                 </div>
                 <div class="form-row">
                     <div class="form-field"><label>Claude Code Model</label><input id="s-claude-code-model" value="sonnet" placeholder="sonnet, opus, or full name" style="width:250px"></div>
+                </div>
+            </div>
+            <div class="divider"></div>
+            <div class="form-section">
+                <h3>Reasoning Effort</h3>
+                <div style="font-size:12px;color:var(--text-secondary);margin-bottom:12px">Per-task-type reasoning effort. Controls how deeply the model thinks before responding.</div>
+                <div class="form-row">
+                    <div class="form-field">
+                        <label>Task / Chat</label>
+                        <select id="s-effort-task" style="width:120px">
+                            <option value="none">none</option>
+                            <option value="low">low</option>
+                            <option value="medium">medium</option>
+                            <option value="high">high</option>
+                        </select>
+                    </div>
+                    <div class="form-field">
+                        <label>Evolution</label>
+                        <select id="s-effort-evolution" style="width:120px">
+                            <option value="none">none</option>
+                            <option value="low">low</option>
+                            <option value="medium">medium</option>
+                            <option value="high">high</option>
+                        </select>
+                    </div>
+                    <div class="form-field">
+                        <label>Review</label>
+                        <select id="s-effort-review" style="width:120px">
+                            <option value="none">none</option>
+                            <option value="low">low</option>
+                            <option value="medium">medium</option>
+                            <option value="high">high</option>
+                        </select>
+                    </div>
+                    <div class="form-field">
+                        <label>Consciousness</label>
+                        <select id="s-effort-consciousness" style="width:120px">
+                            <option value="none">none</option>
+                            <option value="low">low</option>
+                            <option value="medium">medium</option>
+                            <option value="high">high</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+            <div class="divider"></div>
+            <div class="form-section">
+                <h3>Commit Review</h3>
+                <div class="form-row">
+                    <div class="form-field" style="flex:1">
+                        <label>Pre-commit Review Models</label>
+                        <input id="s-review-models" placeholder="model1,model2,model3" style="width:100%">
+                        <div style="font-size:12px;color:var(--text-secondary);margin-top:4px">Comma-separated OpenRouter model IDs used for pre-commit review. Minimum 2 required for quorum.</div>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-field">
+                        <label>Review Enforcement</label>
+                        <select id="s-review-enforcement" style="width:160px">
+                            <option value="advisory">Advisory</option>
+                            <option value="blocking">Blocking</option>
+                        </select>
+                        <div style="font-size:12px;color:var(--text-secondary);margin-top:4px">Review always runs. Advisory surfaces warnings but allows commit; Blocking preserves the current hard gate.</div>
+                    </div>
                 </div>
             </div>
             <div class="divider"></div>
@@ -116,6 +180,13 @@ export function initSettings({ ws, state }) {
         if (s.OUROBOROS_MODEL_LIGHT) document.getElementById('s-model-light').value = s.OUROBOROS_MODEL_LIGHT;
         if (s.OUROBOROS_MODEL_FALLBACK) document.getElementById('s-model-fallback').value = s.OUROBOROS_MODEL_FALLBACK;
         if (s.CLAUDE_CODE_MODEL) document.getElementById('s-claude-code-model').value = s.CLAUDE_CODE_MODEL;
+        const effortTask = s.OUROBOROS_EFFORT_TASK || s.OUROBOROS_INITIAL_REASONING_EFFORT || 'none';
+        document.getElementById('s-effort-task').value = effortTask;
+        document.getElementById('s-effort-evolution').value = s.OUROBOROS_EFFORT_EVOLUTION || 'high';
+        document.getElementById('s-effort-review').value = s.OUROBOROS_EFFORT_REVIEW || 'medium';
+        document.getElementById('s-effort-consciousness').value = s.OUROBOROS_EFFORT_CONSCIOUSNESS || 'low';
+        if (s.OUROBOROS_REVIEW_MODELS) document.getElementById('s-review-models').value = s.OUROBOROS_REVIEW_MODELS;
+        document.getElementById('s-review-enforcement').value = s.OUROBOROS_REVIEW_ENFORCEMENT || 'blocking';
         if (s.OUROBOROS_MAX_WORKERS) document.getElementById('s-workers').value = s.OUROBOROS_MAX_WORKERS;
         if (s.TOTAL_BUDGET) document.getElementById('s-budget').value = s.TOTAL_BUDGET;
         if (s.OUROBOROS_SOFT_TIMEOUT_SEC) document.getElementById('s-soft-timeout').value = s.OUROBOROS_SOFT_TIMEOUT_SEC;
@@ -158,6 +229,9 @@ export function initSettings({ ws, state }) {
             el.style.color = isReady ? 'var(--green)' : d.status === 'error' ? 'var(--red)' : 'var(--text-secondary)';
             document.getElementById('btn-local-stop').style.opacity = isReady ? '1' : '0.5';
             document.getElementById('btn-local-test').style.opacity = isReady ? '1' : '0.5';
+            ['s-local-main', 's-local-code', 's-local-light', 's-local-fallback'].forEach(id => {
+                document.getElementById(id).disabled = !isReady;
+            });
         }).catch(() => {});
     }
     updateLocalStatus();
@@ -215,6 +289,12 @@ export function initSettings({ ws, state }) {
             OUROBOROS_MODEL_LIGHT: document.getElementById('s-model-light').value,
             OUROBOROS_MODEL_FALLBACK: document.getElementById('s-model-fallback').value,
             CLAUDE_CODE_MODEL: document.getElementById('s-claude-code-model').value || 'sonnet',
+            OUROBOROS_EFFORT_TASK: document.getElementById('s-effort-task').value,
+            OUROBOROS_EFFORT_EVOLUTION: document.getElementById('s-effort-evolution').value,
+            OUROBOROS_EFFORT_REVIEW: document.getElementById('s-effort-review').value,
+            OUROBOROS_EFFORT_CONSCIOUSNESS: document.getElementById('s-effort-consciousness').value,
+            OUROBOROS_REVIEW_MODELS: document.getElementById('s-review-models').value.trim(),
+            OUROBOROS_REVIEW_ENFORCEMENT: document.getElementById('s-review-enforcement').value,
             OUROBOROS_MAX_WORKERS: parseInt(document.getElementById('s-workers').value) || 5,
             TOTAL_BUDGET: parseFloat(document.getElementById('s-budget').value) || 10,
             OUROBOROS_SOFT_TIMEOUT_SEC: parseInt(document.getElementById('s-soft-timeout').value) || 600,
